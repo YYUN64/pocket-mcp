@@ -10,6 +10,45 @@
 
 ---
 
+## 快速安装（Linux，推荐）
+
+仓库自带 `install.sh`，默认全是"安全默认值"：
+
+```bash
+git clone https://github.com/YYUN64/pocket-mcp.git
+cd pocket-mcp
+sudo ./install.sh
+```
+
+它会：
+
+1. 检查 Python ≥ 3.8（没有会按发行版给出安装命令）；
+2. 创建**专用系统用户** `pocketmcp`（`nologin`、非 root）；
+3. 装到 `/opt/pocket-mcp`，工作区 `/srv/pocket-mcp-workspace`（服务只在这棵目录里读写）；
+4. 写 systemd 单元并启用，带 `ProtectSystem=strict`、`NoNewPrivileges`、空 capability 等加固；
+5. 启动后自动跑一次 `initialize` 自检，失败会直接打印 journal；
+6. **不擅自改防火墙**，只按发行版打印该敲的命令。
+
+常用参数：`--port 9000`、`--workspace /srv/mcp`、`--bind 127.0.0.1`、`--allow-shell`、`--open-firewall`、`--uninstall`。`--help` 看全部。
+
+## 安全模型（为什么不该用 root）
+
+| 风险点 | 说明 |
+| --- | --- |
+| `run_command` | **默认禁用**。一旦 `--allow-shell` 打开，等于给这个用户一个远程 shell；若服务以 root 跑，那就是**公网 root shell** |
+| 文件工具 | 只能读写 `MCP_WORKSPACE` 内的路径（resolve 后校验，`../` 越界被拒）；如果把工作区设成 `/`，等于全盘可读写 |
+| 无鉴权 | 服务器本身没有账号密码/token，**谁连上谁就能用**，所以不要裸奔在公网 |
+
+部署方式按安全性从高到低：
+
+1. `--bind 127.0.0.1` + SSH 隧道或 Tailscale（最稳，连局域网都不暴露）；
+2. 监听局域网 + 防火墙只放行你的网段（脚本会打印对应命令）；
+3. 直接暴露公网：至少套一层 WireGuard/Tailscale，或放在带认证的反向代理后面。
+
+脚本默认提供的防护是：**非 root 专用用户 + systemd 沙箱 + 工作区隔离**。即使服务被攻破，攻击者拿到的也只是 `pocketmcp` 用户和 `/srv/pocket-mcp-workspace` 一个目录。
+
+---
+
 ## 1. 环境要求
 
 - Python **3.8+**（Windows 推荐 Python 3.11/3.12/3.13/3.14 的 64 位版本；Ubuntu/Debian/Arch/Fedora 的系统 Python 即可）。
@@ -23,6 +62,7 @@
 | --- | --- |
 | `server.py` | 服务器主程序，单文件，包含全部 8 个工具。 |
 | `smoke_test.py` | 自检脚本：initialize、tools/list、每个工具、错误码、越界路径。 |
+| `install.sh` | Linux 一键安装：非 root 专用用户 + systemd + 自检 + 防火墙提示；`--uninstall` 可卸载。 |
 | `mcp-server.service` | systemd 单元模板（含开机自启），需要替换占位符。 |
 | `run-windows.bat` | Windows 一键启动；优先 `py -3`，找不到再退回 `python`。 |
 | `README.md` | 本文档。 |

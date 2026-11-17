@@ -1,38 +1,54 @@
+# pocket-mcp 的 systemd 单元模板
+#
+# 不用 install.sh、想手动装时用这份。把下面四个占位符换掉，然后：
+#   sudo cp mcp-server.service /etc/systemd/system/pocket-mcp.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now pocket-mcp
+#
+# 占位符：
+#   @USER@      运行服务的专用低权限用户（不要用 root），例如 pocketmcp
+#               创建：sudo useradd --system --home-dir /opt/pocket-mcp --no-create-home \
+#                       --shell /usr/sbin/nologin pocketmcp
+#   @PYTHON@    python3 的绝对路径，例如 /usr/bin/python3
+#   @WORKDIR@   代码目录，例如 /opt/pocket-mcp
+#   @WORKSPACE@ 工作区目录（文件工具只能在这里读写），例如 /srv/pocket-mcp-workspace
+#               创建：sudo install -d -m 0750 -o pocketmcp -g pocketmcp /srv/pocket-mcp-workspace
+
 [Unit]
-Description=deepseek-lite-mcp (MCP server for Android chat clients)
-Documentation=file://@WORKDIR@/README.md
+Description=pocket-mcp (MCP server for mobile clients)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-
-# ---------------------------------------------------------------------------
-# 部署前必须修改下面 4 个占位符：
-#   @WORKDIR@  ：server.py 所在目录的绝对路径，例如 /opt/deepseek-lite-mcp
-#   @PYTHON@   ：Python 3.8+ 解释器绝对路径，例如 /usr/bin/python3
-#   @USER@     ：运行服务的普通用户，例如 mcpuser
-#   @GROUP@    ：该用户的主组，例如 mcpuser
-# 可先运行 `which python3` 和 `id mcpuser` 确认路径与用户组。
-# ---------------------------------------------------------------------------
-WorkingDirectory=@WORKDIR@
-ExecStart=@PYTHON@ @WORKDIR@/server.py --host 0.0.0.0 --port 8765
-
-# 工作区优先级：MCP_WORKSPACE 环境变量 > --workspace 参数 > WorkingDirectory。
-# 如果要让文件工具使用另一个目录，取消注释并改成绝对路径（该用户必须可读写）：
-# Environment=MCP_WORKSPACE=@WORKSPACE@
-
-# 出于安全考虑，run_command 默认禁用。确需启用时取消下一行注释并重启服务：
-# Environment=MCP_ALLOW_SHELL=1
-
-Environment=PYTHONUNBUFFERED=1
 User=@USER@
-Group=@GROUP@
+Group=@USER@
+WorkingDirectory=@WORKDIR@
+Environment=MCP_WORKSPACE=@WORKSPACE@
+# 允许 run_command 才设为 1（等于给这个低权限用户一个远程 shell，谨慎）
+Environment=MCP_ALLOW_SHELL=0
+ExecStart=@PYTHON@ -u @WORKDIR@/server.py --host 0.0.0.0 --port 8765
 Restart=on-failure
-RestartSec=3
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=deepseek-lite-mcp
+RestartSec=2
+
+# --- 安全加固：即使服务被利用，也难以影响系统 ---
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ReadWritePaths=@WORKSPACE@
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target
