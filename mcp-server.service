@@ -1,0 +1,38 @@
+[Unit]
+Description=deepseek-lite-mcp (MCP server for Android chat clients)
+Documentation=file://@WORKDIR@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------------------
+# 部署前必须修改下面 4 个占位符：
+#   @WORKDIR@  ：server.py 所在目录的绝对路径，例如 /opt/deepseek-lite-mcp
+#   @PYTHON@   ：Python 3.8+ 解释器绝对路径，例如 /usr/bin/python3
+#   @USER@     ：运行服务的普通用户，例如 mcpuser
+#   @GROUP@    ：该用户的主组，例如 mcpuser
+# 可先运行 `which python3` 和 `id mcpuser` 确认路径与用户组。
+# ---------------------------------------------------------------------------
+WorkingDirectory=@WORKDIR@
+ExecStart=@PYTHON@ @WORKDIR@/server.py --host 0.0.0.0 --port 8765
+
+# 工作区优先级：MCP_WORKSPACE 环境变量 > --workspace 参数 > WorkingDirectory。
+# 如果要让文件工具使用另一个目录，取消注释并改成绝对路径（该用户必须可读写）：
+# Environment=MCP_WORKSPACE=@WORKSPACE@
+
+# 出于安全考虑，run_command 默认禁用。确需启用时取消下一行注释并重启服务：
+# Environment=MCP_ALLOW_SHELL=1
+
+Environment=PYTHONUNBUFFERED=1
+User=@USER@
+Group=@GROUP@
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=deepseek-lite-mcp
+
+[Install]
+WantedBy=multi-user.target
