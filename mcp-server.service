@@ -29,6 +29,7 @@ Environment=MCP_ALLOW_SHELL=0
 ExecStart=@PYTHON@ -u @WORKDIR@/server.py --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=2
+UMask=0077
 
 # --- 安全加固：即使服务被利用，也难以影响系统 ---
 NoNewPrivileges=true

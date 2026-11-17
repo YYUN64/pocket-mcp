@@ -147,6 +147,7 @@ Environment=MCP_ALLOW_SHELL=$ALLOW_SHELL
 ExecStart=$PYTHON -u $INSTALL_DIR/server.py --host $BIND_HOST --port $PORT
 Restart=on-failure
 RestartSec=2
+UMask=0077
 # --- 安全加固：即使被利用也拿不到系统权限 ---
 NoNewPrivileges=true
 PrivateTmp=true
