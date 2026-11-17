@@ -163,9 +163,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR"
   PROTECT_HOME="ProtectHome=read-only"
-  # 用户级 systemd 里普通用户没有 CAP_SETPCAP，写 CapabilityBoundingSet= 会让
-  # 启动直接失败（status=218/CAPABILITIES）。用户服务本来就没有 capability，跳过这两项。
-  EXTRA_HARDENING=""
 else
   UNIT_HEADER="[Unit]
 Description=pocket-mcp (MCP server for mobile clients)
@@ -178,8 +175,36 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR"
   PROTECT_HOME="ProtectHome=true"
-  EXTRA_HARDENING="CapabilityBoundingSet=
+fi
+
+# 通用加固（用户级也能用）
+HARDENING="NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+$PROTECT_HOME
+ReadWritePaths=$WORKSPACE $INSTALL_DIR
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native"
+
+if [ "$USER_MODE" -eq 0 ]; then
+  # 系统级可用完整加固
+  HARDENING="$HARDENING
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+CapabilityBoundingSet=
 AmbientCapabilities="
+else
+  # 用户级 systemd 没有 CAP_SYS_ADMIN / CAP_SETPCAP：PrivateDevices、ProtectKernel*、
+  # ProtectClock/Hostname 以及空的 CapabilityBoundingSet= 都会让服务起不来
+  # （实测 status=218/CAPABILITIES），所以这些只在系统级使用。
+  :
 fi
 
 mkdir -p "$(dirname "$UNIT_PATH")"
@@ -192,23 +217,7 @@ Restart=on-failure
 RestartSec=2
 UMask=0077
 # --- 安全加固 ---
-NoNewPrivileges=true
-PrivateTmp=true
-PrivateDevices=true
-ProtectSystem=strict
-$PROTECT_HOME
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-ProtectClock=true
-ProtectHostname=true
-ReadWritePaths=$WORKSPACE $INSTALL_DIR
-RestrictSUIDSGID=true
-RestrictRealtime=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
-$EXTRA_HARDENING
-SystemCallArchitectures=native
+$HARDENING
 
 [Install]
 WantedBy=default.target

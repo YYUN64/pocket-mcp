@@ -23,6 +23,10 @@ REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/YYUN64/pocket-mcp/main}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 MODE="run"
 
+# 被 `curl ... | bash` 调用时 $0 是 "bash"，提示里给个合理的命令名
+SELF="${BASH_SOURCE[0]:-$0}"
+[ "$SELF" = "bash" ] && SELF="run.sh"
+
 die() { printf '\033[31m错误：%s\033[0m\n' "$*" >&2; exit 1; }
 info() { printf '\033[36m==> %s\033[0m\n' "$*"; }
 
@@ -82,9 +86,10 @@ resolve_server() {
 }
 
 if [ "$MODE" = "stop" ]; then
-  pids="$(pgrep -f 'server.py --host' || true)"
+  # 只杀监听这个端口的实例，避免误伤别的 pocket-mcp
+  pids="$(pgrep -f "server.py --host .*--port $PORT" || true)"
   if [ -z "$pids" ]; then
-    echo "没有在运行的后台实例"
+    echo "端口 $PORT 上没有在运行的后台实例"
   else
     # shellcheck disable=SC2086
     kill $pids && echo "已停止：$pids"
@@ -101,14 +106,14 @@ info "Python: $PYTHON / 端口: $PORT / 工作区: $WORKSPACE / 用户: $(id -un
 if [ "$MODE" = "daemon" ]; then
   mkdir -p "$DATA_DIR"
   LOG="$DATA_DIR/server.log"
-  if pgrep -f 'server.py --host' >/dev/null 2>&1; then
-    die "已经有实例在跑（先 ./run.sh --stop）"
+  if pgrep -f "server.py --host .*--port $PORT" >/dev/null 2>&1; then
+    die "端口 $PORT 上已有实例在跑（先 $SELF --port $PORT --stop）"
   fi
   MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" \
     nohup "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT" >> "$LOG" 2>&1 &
   sleep 1
   info "已在后台启动，日志：$LOG"
-  echo "  停止：$0 --stop"
+  echo "  停止：$SELF --port $PORT --stop"
 else
   info "前台运行中，Ctrl+C 停止"
   exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" \

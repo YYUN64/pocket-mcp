@@ -63,6 +63,8 @@ sudo ./install.sh
 | 专用用户 | 用你自己 | 用你自己 | `pocketmcp` |
 | 沙箱 | 无（就你本人的权限） | systemd 用户级沙箱 | systemd 系统级沙箱 + 空 capability |
 
+> 说明：用户级模式下 `systemd-analyze --user security` 会比系统级差（实测 8.1 EXPOSED vs 4.4 OK）。原因是普通用户的 systemd 没有 `CAP_SYS_ADMIN`/`CAP_SETPCAP`，`PrivateDevices`、`ProtectKernel*`、空的 `CapabilityBoundingSet=` 这类选项会让服务**直接起不来**（`status=218/CAPABILITIES`），所以用户级只保留能用的那部分。用户级的安全边界来自"它就是你自己的权限"，要更强隔离就用系统级。
+
 ## 安全模型（为什么不该用 root）
 
 | 风险点 | 说明 |
