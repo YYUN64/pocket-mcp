@@ -10,26 +10,58 @@
 
 ---
 
-## 快速安装（Linux，推荐）
+## 三种用起来的方式
 
-仓库自带 `install.sh`，默认全是"安全默认值"：
+| 方式 | 一条命令 | 需要 root？ |
+| --- | --- | --- |
+| **直接跑**（最简单） | `curl -fsSL https://raw.githubusercontent.com/YYUN64/pocket-mcp/main/run.sh \| bash` | ❌ 不需要 |
+| **用户级常驻**（登录即起） | `./install.sh --user` | ❌ 不需要 |
+| **系统级服务**（机器级部署） | `sudo ./install.sh` | ✅ 需要 |
+
+### 1. 直接跑（无 sudo、无安装）
 
 ```bash
-git clone https://github.com/YYUN64/pocket-mcp.git
-cd pocket-mcp
+# 已 clone 到本地
+./run.sh                      # 前台运行，0.0.0.0:8765
+./run.sh --port 9000 --daemon # 后台运行，日志在 ~/.local/share/pocket-mcp/server.log
+./run.sh --stop               # 停掉后台实例
+
+# 没有 clone：一条命令下载并运行
+curl -fsSL https://raw.githubusercontent.com/YYUN64/pocket-mcp/main/run.sh | bash
+```
+
+`run.sh` **不写 `/etc`、不建用户、不需要 sudo**，全部以当前用户身份运行；`server.py` 会下载到 `~/.local/share/pocket-mcp/`，工作区默认 `~/pocket-mcp-workspace`。
+
+### 2. 用户级常驻（仍然不需要 sudo）
+
+```bash
+./install.sh --user                          # 装到 ~/.local/share/pocket-mcp
+./install.sh --user --port 9000 --allow-shell
+./install.sh --user --uninstall
+```
+
+写的是 `~/.config/systemd/user/pocket-mcp.service`，用 `systemctl --user` 管理。想让它在**不登录时也开机自启**，再执行一次：
+
+```bash
+loginctl enable-linger $USER
+```
+
+### 3. 系统级服务（需要 sudo）
+
+```bash
 sudo ./install.sh
 ```
 
-它会：
+只有在「整台机器共用一个服务、要用专用系统用户」时才需要 root。它会创建 `pocketmcp` 用户并把服务装到 `/etc/systemd/system`。
 
-1. 检查 Python ≥ 3.8（没有会按发行版给出安装命令）；
-2. 创建**专用系统用户** `pocketmcp`（`nologin`、非 root）；
-3. 装到 `/opt/pocket-mcp`，工作区 `/srv/pocket-mcp-workspace`（服务只在这棵目录里读写）；
-4. 写 systemd 单元并启用，带 `ProtectSystem=strict`、`NoNewPrivileges`、空 capability 等加固；
-5. 启动后自动跑一次 `initialize` 自检，失败会直接打印 journal；
-6. **不擅自改防火墙**，只按发行版打印该敲的命令。
+### 三种方式的区别
 
-常用参数：`--port 9000`、`--workspace /srv/mcp`、`--bind 127.0.0.1`、`--allow-shell`、`--open-firewall`、`--uninstall`。`--help` 看全部。
+| | run.sh | install.sh --user | sudo install.sh |
+| --- | --- | --- | --- |
+| root | 不需要 | 不需要 | 需要 |
+| 开机自启 | ❌（除非自己加 cron/计划任务） | ✅（配合 linger） | ✅ |
+| 专用用户 | 用你自己 | 用你自己 | `pocketmcp` |
+| 沙箱 | 无（就你本人的权限） | systemd 用户级沙箱 | systemd 系统级沙箱 + 空 capability |
 
 ## 安全模型（为什么不该用 root）
 
@@ -62,7 +94,8 @@ sudo ./install.sh
 | --- | --- |
 | `server.py` | 服务器主程序，单文件，包含全部 8 个工具。 |
 | `smoke_test.py` | 自检脚本：initialize、tools/list、每个工具、错误码、越界路径。 |
-| `install.sh` | Linux 一键安装：非 root 专用用户 + systemd + 自检 + 防火墙提示；`--uninstall` 可卸载。 |
+| `install.sh` | Linux 安装：`--user` 用户级（无 sudo）/ 默认系统级（sudo）+ systemd 沙箱 + 自检 + 防火墙提示；`--uninstall` 卸载。 |
+| `run.sh` | 直接运行脚本：一条 `curl … | bash` 即可，无需 root、无需安装；支持 `--daemon` / `--stop`。 |
 | `mcp-server.service` | systemd 单元模板（含开机自启），需要替换占位符。 |
 | `run-windows.bat` | Windows 一键启动；优先 `py -3`，找不到再退回 `python`。 |
 | `README.md` | 本文档。 |

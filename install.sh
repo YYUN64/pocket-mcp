@@ -163,6 +163,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR"
   PROTECT_HOME="ProtectHome=read-only"
+  # 用户级 systemd 里普通用户没有 CAP_SETPCAP，写 CapabilityBoundingSet= 会让
+  # 启动直接失败（status=218/CAPABILITIES）。用户服务本来就没有 capability，跳过这两项。
+  EXTRA_HARDENING=""
 else
   UNIT_HEADER="[Unit]
 Description=pocket-mcp (MCP server for mobile clients)
@@ -175,6 +178,8 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR"
   PROTECT_HOME="ProtectHome=true"
+  EXTRA_HARDENING="CapabilityBoundingSet=
+AmbientCapabilities="
 fi
 
 mkdir -p "$(dirname "$UNIT_PATH")"
@@ -202,8 +207,7 @@ RestrictSUIDSGID=true
 RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+$EXTRA_HARDENING
 SystemCallArchitectures=native
 
 [Install]
