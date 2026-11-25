@@ -675,24 +675,48 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
             "注意：启用后，能访问该端口的任何人都能在服务器上执行命令。"
         )
     command = _string_arg(arguments, "command", required=True, allow_empty=False)
-    timeout = _number_arg(arguments, "timeout", 30.0, 1.0, 300.0)
+    # 单次命令最长 120 秒：超过夹到 120（不报错），避免一次工具调用把客户端拖到读超时
+    raw_timeout = arguments.get("timeout", 30.0)
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError):
+        raise ToolError("参数 timeout 必须是数字（秒）")
+    if not math.isfinite(timeout):
+        raise ToolError("参数 timeout 必须是有限数字（秒）")
+    timeout = max(1.0, min(120.0, timeout))
     assert command is not None
+    summary = re.sub(r"\s+", " ", command).strip()[:200]
+    child_env = dict(os.environ)
+    # 避免交互式/分页器把管道挂住（systemctl、apt、git 等）
+    child_env.update({
+        "TERM": "dumb",
+        "PAGER": "cat",
+        "SYSTEMD_PAGER": "cat",
+        "SYSTEMD_COLORS": "0",
+        "SYSTEMD_ASK_PASSWORD": "false",
+        "DEBIAN_FRONTEND": "noninteractive",
+    })
     popen_kwargs: Dict[str, Any] = {}
     if os.name == "nt":
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     else:
         # 新进程组：超时时可以连同孙进程一起杀
         popen_kwargs["start_new_session"] = True
+    started_at = time.monotonic()
+    log("run_command：%s（timeout=%.0fs）" % (summary, timeout))
     try:
         proc = subprocess.Popen(
             command,
             shell=True,
             cwd=str(WORKSPACE),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=child_env,
             **popen_kwargs,
         )
     except OSError as exc:
+        log("run_command：%s → 启动失败：%s" % (summary, exc))
         raise ToolError("无法启动命令：%s" % exc)
 
     try:
@@ -710,6 +734,8 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
                 stream.close()
             except (OSError, AttributeError):
                 pass
+        elapsed = (time.monotonic() - started_at) * 1000
+        log("run_command：%s → 超时 %.0fs（实际 %.0f ms）" % (summary, timeout, elapsed))
         message = "命令执行超时（%.1f 秒），已终止整个进程组。" % timeout
         if partial:
             message += "\n已捕获的输出：\n" + partial.rstrip()
@@ -720,6 +746,11 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
         output = output.rstrip()
     else:
         output = "（无输出）"
+    elapsed = (time.monotonic() - started_at) * 1000
+    log(
+        "run_command：%s → 退出码 %d，%.0f ms"
+        % (summary, proc.returncode, elapsed)
+    )
     return "退出码：%d\n输出：\n%s" % (proc.returncode, output)
 
 
@@ -933,7 +964,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "description": (
             "在工作区根目录执行一条 shell 命令，返回合并后的 stdout/stderr 和退出码。"
             "出于安全考虑默认禁用，只有服务器环境变量 MCP_ALLOW_SHELL=1 时才可用，"
-            "并受 timeout（默认 30 秒，最大 300 秒）限制；超时会杀掉整个进程组（含孙进程）。"
+            "并受 timeout（默认 30 秒，最大 120 秒）限制；超时会杀掉整个进程组（含孙进程）。"
         ),
         "inputSchema": {
             "type": "object",
