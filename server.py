@@ -207,11 +207,51 @@ def text_result(text: str, is_error: bool = False) -> Dict[str, Any]:
 # 每次 tools/call 的执行元信息（线程本地，避免并发请求互相覆盖）
 CALL_META = threading.local()
 
+# 正在执行的 run_command：json-rpc request id -> {"proc": Popen, "cancelled": bool}
+ACTIVE_COMMANDS: Dict[Any, Dict[str, Any]] = {}
+ACTIVE_COMMANDS_LOCK = threading.Lock()
+CURRENT_REQUEST = threading.local()
+
+
+class ToolCancelled(ToolError):
+    """用户取消：保留已捕获输出，作为 isError 结果返回。"""
+
 
 def reset_call_meta() -> None:
     CALL_META.code = None
     CALL_META.timeout = False
+    CALL_META.cancelled = False
+    CALL_META.timeoutSeconds = None
     CALL_META.dispatched = False
+
+
+def cancel_request(request_id: Any) -> bool:
+    """取消一次正在执行的 tools/call（SIGINT，2 秒后 SIGKILL）。"""
+    with ACTIVE_COMMANDS_LOCK:
+        entry = ACTIVE_COMMANDS.get(request_id)
+    if entry is None:
+        return False
+    entry["cancelled"] = True
+    proc = entry["proc"]
+    started = time.monotonic()
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.send_signal(signal.SIGINT)
+        except OSError:
+            pass
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and proc.poll() is None:
+        time.sleep(0.05)
+    forced = proc.poll() is None
+    if forced:
+        _kill_process_tree(proc)
+    log(
+        "取消 run_command（id=%s）→ SIGINT 后 %.1fs %s"
+        % (request_id, time.monotonic() - started, "SIGKILL" if forced else "退出")
+    )
+    return True
 
 
 def _string_arg(
@@ -714,6 +754,8 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
         popen_kwargs["start_new_session"] = True
     started_at = time.monotonic()
     log("run_command：%s（timeout=%.0fs）" % (summary, timeout))
+    request_id = getattr(CURRENT_REQUEST, "id", None)
+    entry: Dict[str, Any] = {"proc": None, "cancelled": False}
     try:
         proc = subprocess.Popen(
             command,
@@ -726,6 +768,10 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
             **popen_kwargs,
         )
         CALL_META.dispatched = True
+        entry["proc"] = proc
+        if request_id is not None:
+            with ACTIVE_COMMANDS_LOCK:
+                ACTIVE_COMMANDS[request_id] = entry
     except OSError as exc:
         log("run_command：%s → 启动失败：%s" % (summary, exc))
         raise ToolError("无法启动命令：%s" % exc)
@@ -754,12 +800,21 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
         if partial:
             message += "\n已捕获的输出：\n" + partial.rstrip()
         raise ToolError(message)
+    finally:
+        if request_id is not None:
+            with ACTIVE_COMMANDS_LOCK:
+                ACTIVE_COMMANDS.pop(request_id, None)
 
     output = _decode_process_output(stdout)
     if output:
         output = output.rstrip()
     else:
         output = "（无输出）"
+    if entry.get("cancelled"):
+        CALL_META.cancelled = True
+        elapsed = (time.monotonic() - started_at) * 1000
+        log("run_command：%s → 已取消，%.0f ms" % (summary, elapsed))
+        raise ToolCancelled("用户停止了该命令（已中断），已捕获输出：\n" + output)
     elapsed = (time.monotonic() - started_at) * 1000
     CALL_META.code = proc.returncode
     log(
@@ -1044,7 +1099,7 @@ TOOL_HANDLERS: Dict[str, Callable[[Dict[str, Any]], str]] = {
 }
 
 
-def call_tool(params: Any) -> Dict[str, Any]:
+def call_tool(params: Any, request_id: Any = None) -> Dict[str, Any]:
     if not isinstance(params, dict):
         return text_result("tools/call 的 params 必须是对象", True)
     name = params.get("name")
@@ -1059,6 +1114,7 @@ def call_tool(params: Any) -> Dict[str, Any]:
     if handler is None:
         return text_result("未知工具：%s" % name, True)
     reset_call_meta()
+    CURRENT_REQUEST.id = request_id
     started_at = time.monotonic()
 
     def with_meta(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1073,6 +1129,8 @@ def call_tool(params: Any) -> Dict[str, Any]:
             seconds = getattr(CALL_META, "timeoutSeconds", None)
             if seconds is not None:
                 meta["timeoutSeconds"] = int(seconds)
+        if getattr(CALL_META, "cancelled", False):
+            meta["cancelled"] = True
         result["_meta"] = meta
         return result
 
@@ -1081,6 +1139,8 @@ def call_tool(params: Any) -> Dict[str, Any]:
         if name != "run_command":
             CALL_META.code = 0
         return with_meta(text_result(result, False))
+    except ToolCancelled as exc:
+        return with_meta(text_result(str(exc), True))
     except ToolError as exc:
         return with_meta(text_result(str(exc), True))
     except Exception as exc:
@@ -1134,6 +1194,13 @@ def process_rpc(message: Any) -> Tuple[int, Optional[Dict[str, Any]], str]:
         )
     if method == "notifications/initialized":
         return 202, None, method
+    if method == "notifications/cancelled":
+        # 客户端点了「停止」：按 requestId 找到正在跑的 run_command 并杀掉进程组
+        params = message.get("params")
+        target = params.get("requestId") if isinstance(params, dict) else None
+        if target is not None:
+            cancel_request(target)
+        return 202, None, method
     if "id" not in message:
         # JSON-RPC notification: no response body.
         return 202, None, method
@@ -1182,7 +1249,13 @@ def process_rpc(message: Any) -> Tuple[int, Optional[Dict[str, Any]], str]:
         return 200, rpc_result(request_id, {"tools": TOOL_DEFINITIONS}), method
 
     if method == "tools/call":
-        return 200, rpc_result(request_id, call_tool(params)), method
+        return 200, rpc_result(request_id, call_tool(params, request_id)), method
+
+    if method == "tools/cancel":
+        # 兼容不支持 notifications/cancelled 的客户端：params {"id": <requestId>}
+        target = params.get("id") if isinstance(params, dict) else None
+        cancelled = cancel_request(target) if target is not None else False
+        return 200, rpc_result(request_id, {"cancelled": cancelled}), method
 
     return (
         200,
