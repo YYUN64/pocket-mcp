@@ -717,5 +717,5 @@ set PYTHONIOENCODING=utf-8
 
 ## License
 
-MIT，见 [LICENSE](LICENSE)。
+GPL-2.0-or-later，见 [LICENSE](LICENSE)。
 
