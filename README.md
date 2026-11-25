@@ -106,8 +106,9 @@ python smoke_test.py http://127.0.0.1:8765 --token '<token>'
 
 说明：
 
-- token 会写进 systemd 单元（`Environment=MCP_TOKEN=...`），单元文件对 root 可见；不要把带 token 的单元文件提交到仓库。
-- 轮换 token：重新执行一次 `./install.sh --token '<新 token>'`（或改 `MCP_TOKEN` 后重启服务），App 里也改成新值。
+- **token 是明文经 HTTP 发送的**：Bearer 头本身不加密，公网直连 `http://IP:9000/mcp` 时任何链路上的节点都能看到 token。公网使用请在前面加 HTTPS 反向代理（如 `nginx` + certbot 免费证书），或用 WireGuard / Tailscale 组网后再走内网地址，不要裸奔 http。
+- token 会写进 systemd 的环境配置文件（`/etc/pocket-mcp/token.env`，权限 600）而不是单元文件本身；不要把带 token 的文件提交到仓库。
+- 轮换 token：重新执行一次 `./install.sh --token '<新 token>'`（或改环境文件后 `systemctl restart pocket-mcp`），App 里也改成新值。
 - 只监听本机时（`--bind 127.0.0.1` + SSH 隧道）可以不设 token，但一旦对公网开放就必须设。
 
 ## 安全模型（为什么不该用 root）
@@ -538,7 +539,7 @@ IP：192.168.1.23
 | `read_file` | `path`、`max_bytes`（默认 200000） | 读取 UTF-8 文本；二进制文件返回提示。 |
 | `write_file` | `path`、`content` | 写入 UTF-8 文本，自动创建父目录，返回字节数。 |
 | `search_files` | `pattern`、`file_glob`（默认 `**/*`）、`max_results`（默认 100） | 正则搜索，返回 `路径:行号: 行内容`。 |
-| `run_command` | `command`、`timeout`（默认 30 秒） | 默认禁用；仅 `MCP_ALLOW_SHELL=1` 时可用。 |
+| `run_command` | `command`、`timeout`（默认 30 秒） | 默认禁用；仅 `MCP_ALLOW_SHELL=1` 时可用。超时会杀掉整个进程组（含孙进程），不会留下占着管道的孤儿进程。 |
 | `http_fetch` | `url`、`max_bytes`（默认 200000）、`strip_html`（默认 true） | urllib 抓取，带 User-Agent、跟随重定向、20 秒超时。 |
 
 统一限制：

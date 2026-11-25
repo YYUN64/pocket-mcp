@@ -26,6 +26,7 @@ import locale
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -621,6 +622,25 @@ def _decode_process_output(data: Any) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _kill_process_tree(proc: "subprocess.Popen[bytes]") -> None:
+    """杀掉整个进程组（包括 shell 的孙进程），避免超时后孙进程占着管道把 handler 卡死。"""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def tool_run_command(arguments: Dict[str, Any]) -> str:
     if not ALLOW_SHELL:
         raise ToolError(
@@ -633,30 +653,50 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
     command = _string_arg(arguments, "command", required=True, allow_empty=False)
     timeout = _number_arg(arguments, "timeout", 30.0, 1.0, 300.0)
     assert command is not None
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        # 新进程组：超时时可以连同孙进程一起杀
+        popen_kwargs["start_new_session"] = True
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             command,
             shell=True,
             cwd=str(WORKSPACE),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout,
+            **popen_kwargs,
         )
-    except subprocess.TimeoutExpired as exc:
-        partial = _decode_process_output(exc.stdout)
-        message = "命令执行超时（%.1f 秒），已终止。" % timeout
-        if partial:
-            message += "\n已捕获的输出：\n" + partial.rstrip()
-        raise ToolError(message)
     except OSError as exc:
         raise ToolError("无法启动命令：%s" % exc)
 
-    output = _decode_process_output(completed.stdout)
+    try:
+        stdout, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        partial = _decode_process_output(exc.output if exc.output is not None else b"")
+        _kill_process_tree(proc)
+        # 等 shell 退出；管道这端也主动关掉，避免逃逸的孙进程继续占着读端把 handler 拖住
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except (OSError, AttributeError):
+                pass
+        message = "命令执行超时（%.1f 秒），已终止整个进程组。" % timeout
+        if partial:
+            message += "\n已捕获的输出：\n" + partial.rstrip()
+        raise ToolError(message)
+
+    output = _decode_process_output(stdout)
     if output:
         output = output.rstrip()
     else:
         output = "（无输出）"
-    return "退出码：%d\n输出：\n%s" % (completed.returncode, output)
+    return "退出码：%d\n输出：\n%s" % (proc.returncode, output)
 
 
 def _strip_html_markup(text: str) -> str:
@@ -869,7 +909,7 @@ TOOL_DEFINITIONS: List[Dict[str, Any]] = [
         "description": (
             "在工作区根目录执行一条 shell 命令，返回合并后的 stdout/stderr 和退出码。"
             "出于安全考虑默认禁用，只有服务器环境变量 MCP_ALLOW_SHELL=1 时才可用，"
-            "并受 timeout（默认 30 秒，最大 300 秒）限制。"
+            "并受 timeout（默认 30 秒，最大 300 秒）限制；超时会杀掉整个进程组（含孙进程）。"
         ),
         "inputSchema": {
             "type": "object",
