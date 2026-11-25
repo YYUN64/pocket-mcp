@@ -3,6 +3,8 @@
 
 Usage:
     python smoke_test.py http://127.0.0.1:8765
+    python smoke_test.py https://127.0.0.1:8765            # 自签：默认跳过证书校验
+    python smoke_test.py https://127.0.0.1:8765 --ca tls/cert.pem   # 严格校验
     python smoke_test.py http://127.0.0.1:8765 --allow-shell
     python smoke_test.py http://127.0.0.1:8765 --strict-http
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import ssl
 import sys
 import time
 import urllib.error
@@ -42,7 +45,13 @@ def short(value: Any, limit: int = 300) -> str:
 
 
 class MCPClient:
-    def __init__(self, base_url: str, timeout: float = 30.0, token: str = "") -> None:
+    def __init__(
+        self,
+        base_url: str,
+        timeout: float = 30.0,
+        token: str = "",
+        ca_file: str = "",
+    ) -> None:
         base_url = base_url.rstrip("/")
         if base_url.endswith("/mcp"):
             self.endpoint = base_url
@@ -52,6 +61,14 @@ class MCPClient:
         self.base_url = base_url
         self.timeout = timeout
         self.token = token.strip()
+        # HTTPS：默认跳过证书校验（等价 curl -k）；给了 --ca 就严格校验
+        self.context = None
+        if base_url.startswith("https://"):
+            if ca_file:
+                self.context = ssl.create_default_context(cafile=ca_file)
+            else:
+                self.context = ssl._create_unverified_context()
+                print("[警告] 已跳过证书校验（自签证书的临时用法，等价 curl -k）")
         self._next_id = 1
 
     def _headers(self, token: Optional[str] = None) -> Dict[str, str]:
@@ -69,7 +86,7 @@ class MCPClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
                 status = response.getcode()
                 headers = dict(response.headers.items())
                 data = response.read()
@@ -84,7 +101,7 @@ class MCPClient:
         headers = {"Authorization": "Bearer " + self.token} if self.token else {}
         request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout, context=self.context) as response:
                 return response.getcode(), response.read().decode(
                     "utf-8", errors="replace"
                 )
@@ -162,13 +179,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP 超时秒数")
     parser.add_argument(
+        "--ca",
+        default="",
+        help="HTTPS 严格校验时使用的 CA/自签证书 PEM；不传则跳过证书校验（等价 curl -k）",
+    )
+    parser.add_argument(
         "--token",
         default=os.environ.get("MCP_TOKEN", ""),
         help="服务器设置了 MCP_TOKEN 时传入；会额外测试“无 token/错误 token -> 401”",
     )
     args = parser.parse_args(argv)
 
-    client = MCPClient(args.base_url, timeout=args.timeout, token=args.token)
+    client = MCPClient(
+        args.base_url,
+        timeout=args.timeout,
+        token=args.token,
+        ca_file=args.ca,
+    )
     passed = 0
     failed = 0
     skipped = 0

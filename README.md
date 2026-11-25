@@ -546,6 +546,10 @@ curl -sS -X POST http://127.0.0.1:8765/mcp \
 
 ```bash
 python3 smoke_test.py http://127.0.0.1:8765
+# 服务端开了 TLS（自签）：默认跳过证书校验（等价 curl -k），会打印一行警告
+python3 smoke_test.py https://127.0.0.1:9000 --token '<token>'
+# 想严格校验证书（自签证书需要指定它本身）：
+python3 smoke_test.py https://127.0.0.1:9000 --ca /opt/pocket-mcp/tls/cert.pem
 ```
 
 如果服务器的 `MCP_ALLOW_SHELL=1`：
@@ -559,6 +563,8 @@ python3 smoke_test.py http://127.0.0.1:8765 --allow-shell
 ```bash
 python3 smoke_test.py http://127.0.0.1:8765 --strict-http
 ```
+
+curl 访问自签 HTTPS 需要加 `-k`（或 `--cacert /opt/pocket-mcp/tls/cert.pem` 严格校验），详见上面的 TLS 小节。
 
 ---
 
