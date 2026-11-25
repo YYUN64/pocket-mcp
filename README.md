@@ -86,7 +86,25 @@ KEY
   签名为 `RSA-SHA256("POST\n/mcp\n" + sha256hex(body) + "\n" + timestamp + "\n" + nonce)`（PKCS#1 v1.5）。
 - 服务端只用标准库验签（`pow(sig,e,n)` + DigestInfo 比对），时间戳 ±300 秒、nonce 5 分钟内不可重放，
   失败返回 `401` + `-32001`（带“时间戳过期 / nonce 重放 / 未知 key id / 签名不匹配”等原因）。
-- 追加/删除公钥即生效；`--pubkey-file` / `MCP_PUBKEY_FILE` 可改路径（默认 `/etc/mcp/authorized_keys`）。
+- 追加/删除公钥即生效；`--pubkey-file` / `MCP_PUBKEY_FILE` 可改路径（默认见下）。
+
+#### 公钥放哪里
+
+| 安装方式 | 默认路径 | 权限 | 谁能写 |
+| --- | --- | --- | --- |
+| 系统级（`sudo ./install.sh`） | `/etc/mcp/authorized_keys` | `root:root 0644` | root |
+| 用户级（`./install.sh --user`） | `~/.config/pocket-mcp/authorized_keys` | `600`（你自己） | 你自己，不需要 root |
+| 直接跑（`./run.sh`） | 由 `--pubkey-file` 指定（不指定则不启用签名） | 自己掌握 | 你自己 |
+
+追加公钥（系统级需要 sudo；可以带 `ssh-rsa ` 前缀或每行只放 base64，`#` 开头是注释）：
+
+```bash
+sudo mkdir -p /etc/mcp
+echo "ssh-rsa <App 里复制的 base64 公钥>" | sudo tee -a /etc/mcp/authorized_keys
+sudo chmod 644 /etc/mcp/authorized_keys
+```
+
+服务以 `pocketmcp` 用户运行，只需**读**这个文件；文件是公钥，泄露没有风险。换机/重装时：删掉旧的公钥行、追加新的、保存即生效（按 mtime 热加载，不用重启）。
 
 ### 方式二：Bearer token（兼容保留）
 

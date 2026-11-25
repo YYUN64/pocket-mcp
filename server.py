@@ -1190,8 +1190,15 @@ def load_pubkeys() -> Dict[str, Tuple[int, int]]:
                     line = line.strip()
                     if not line or line.startswith("#"):
                         continue
+                    # 兼容 SSH 习惯：`ssh-rsa <base64> [comment]`，也接受纯 base64
+                    parts = line.split()
+                    if parts and parts[0] in ("ssh-rsa", "rsa-sha2-256", "rsa-sha2-512"):
+                        parts = parts[1:]
+                    token = parts[0] if parts else ""
+                    if not token:
+                        continue
                     try:
-                        spki = base64.b64decode(line, validate=True)
+                        spki = base64.b64decode(token, validate=True)
                         n, e = parse_rsa_spki(spki)
                     except Exception:
                         continue

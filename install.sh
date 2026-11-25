@@ -21,7 +21,7 @@ PORT="${PORT:-8765}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
 TOKEN="${MCP_TOKEN:-}"
-PUBKEY_FILE="${MCP_PUBKEY_FILE:-/etc/mcp/authorized_keys}"
+PUBKEY_FILE="${MCP_PUBKEY_FILE:-}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DO_UNINSTALL=0
@@ -61,11 +61,15 @@ if [ "$USER_MODE" -eq 1 ]; then
   WORKSPACE="${WORKSPACE:-$HOME/pocket-mcp-workspace}"
   UNIT_PATH="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
   SYSTEMCTL=(systemctl --user)
+  PUBKEY_FILE="${PUBKEY_FILE:-$HOME/.config/pocket-mcp/authorized_keys}"
+  PUBKEY_MODE=600
 else
   INSTALL_DIR="${INSTALL_DIR:-/opt/pocket-mcp}"
   WORKSPACE="${WORKSPACE:-/srv/pocket-mcp-workspace}"
   UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
   SYSTEMCTL=(systemctl)
+  PUBKEY_FILE="${PUBKEY_FILE:-/etc/mcp/authorized_keys}"
+  PUBKEY_MODE=644
 fi
 
 need_root() { [ "$(id -u)" -eq 0 ] || die "系统级安装需要 root，请用 sudo；或者用 --user 装成用户级服务（不需要 sudo）"; }
@@ -225,8 +229,8 @@ fi
 mkdir -p "$(dirname "$PUBKEY_FILE")"
 if [ ! -f "$PUBKEY_FILE" ]; then
   : > "$PUBKEY_FILE"
-  chmod 644 "$PUBKEY_FILE"
-  info "已创建公钥文件 $PUBKEY_FILE（当前为空，把 App 里复制的公钥追加进去）"
+  chmod "$PUBKEY_MODE" "$PUBKEY_FILE"
+  info "已创建公钥文件 $PUBKEY_FILE（$PUBKEY_MODE；把 App 里复制的公钥追加进去）"
 fi
 info "签名鉴权：公钥文件 $PUBKEY_FILE"
 cat > "$UNIT_PATH" <<EOF

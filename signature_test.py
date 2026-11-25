@@ -94,7 +94,8 @@ def main(argv=None) -> int:
     key_id = hashlib.sha256(base64.b64decode(spki_b64)).hexdigest()[:16]
     with open(auth_path, "w", encoding="utf-8") as handle:
         handle.write("# test keys\n")
-        handle.write(spki_b64 + "\n")
+        # 带 ssh-rsa 前缀 + 注释，覆盖前缀解析
+        handle.write("ssh-rsa " + spki_b64 + " test-comment\n")
 
     env = dict(os.environ)
     env.update(
