@@ -148,6 +148,37 @@ python signature_test.py --server ./server.py --port 18765
 - 轮换 token：重新执行一次 `./install.sh --token '<新 token>'`（或改环境文件后 `systemctl restart pocket-mcp`），App 里也改成新值。
 - 只监听本机时（`--bind 127.0.0.1` + SSH 隧道）可以不设 token，但一旦对公网开放就必须设。
 
+## TLS 加密
+
+公网部署建议直接开 TLS（**不需要域名、nginx 或额外 App**）：
+
+```bash
+# 自签（10 年，自动生成在 MCP_TLS_DIR，默认 ~/.local/share/pocket-mcp/tls/）
+./run.sh --tls-selfsigned
+sudo ./install.sh --tls-selfsigned     # 证书在 /opt/pocket-mcp/tls/（700）
+
+# 或用自己的证书
+./run.sh --tls-cert /path/cert.pem --tls-key /path/key.pem
+```
+
+启动日志会打印证书指纹（SHA-256，冒号大写），例如：
+
+```
+TLS：已启用（/opt/pocket-mcp/tls/cert.pem，最低 TLS 1.2）
+证书指纹（SHA-256）：35:69:FB:33:...:7D:9F
+```
+
+App 首次连接会弹窗显示同一指纹，核对后「信任并重试」；以后指纹变了会拒绝连接（防中间人）。
+验证与排查：
+
+```bash
+echo | openssl s_client -connect 127.0.0.1:9000 2>/dev/null | openssl x509 -noout -fingerprint -sha256 -dates
+curl -k https://127.0.0.1:9000/          # 自签需要 -k
+curl -k https://127.0.0.1:9000/mcp -X POST -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+```
+
+明文 `http://` 会被拒绝（连接被重置）。客户端身份仍靠请求签名，TLS 只负责链路加密。
+
 ## 安全模型（为什么不该用 root）
 
 | 风险点 | 说明 |

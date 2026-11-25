@@ -22,6 +22,9 @@ BIND_HOST="${BIND_HOST:-0.0.0.0}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
 TOKEN="${MCP_TOKEN:-}"
 PUBKEY_FILE="${MCP_PUBKEY_FILE:-}"
+TLS_SELFSIGNED="${MCP_TLS_SELFSIGNED:-0}"
+TLS_CERT="${MCP_TLS_CERT:-}"
+TLS_KEY="${MCP_TLS_KEY:-}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DO_UNINSTALL=0
@@ -48,6 +51,9 @@ while [ $# -gt 0 ]; do
     --token=*) TOKEN="${1#--token=}"; shift ;;
     --pubkey-file) PUBKEY_FILE="${2:?缺少公钥文件路径}"; shift 2 ;;
     --pubkey-file=*) PUBKEY_FILE="${1#--pubkey-file=}"; shift ;;
+    --tls-selfsigned) TLS_SELFSIGNED=1; shift ;;
+    --tls-cert) TLS_CERT="${2:?缺少证书路径}"; shift 2 ;;
+    --tls-key) TLS_KEY="${2:?缺少私钥路径}"; shift 2 ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --open-firewall) OPEN_FIREWALL=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
@@ -233,11 +239,24 @@ if [ ! -f "$PUBKEY_FILE" ]; then
   info "已创建公钥文件 $PUBKEY_FILE（$PUBKEY_MODE；把 App 里复制的公钥追加进去）"
 fi
 info "签名鉴权：公钥文件 $PUBKEY_FILE"
+if [ "$TLS_SELFSIGNED" = "1" ]; then
+  TLS_DIR="$INSTALL_DIR/tls"
+  mkdir -p "$TLS_DIR"
+  if [ "$USER_MODE" -eq 0 ] && id "$SERVICE_USER" >/dev/null 2>&1; then
+    chown "$SERVICE_USER:$SERVICE_USER" "$TLS_DIR" 2>/dev/null || true
+  fi
+  chmod 700 "$TLS_DIR"
+  info "TLS 自签目录：$TLS_DIR（700，证书在首次启动时生成）"
+fi
 cat > "$UNIT_PATH" <<EOF
 $UNIT_HEADER
 Environment=MCP_WORKSPACE=$WORKSPACE
 Environment=MCP_ALLOW_SHELL=$ALLOW_SHELL
 Environment=MCP_PUBKEY_FILE=$PUBKEY_FILE
+Environment=MCP_TLS_SELFSIGNED=$TLS_SELFSIGNED
+Environment=MCP_TLS_DIR=$INSTALL_DIR/tls
+Environment=MCP_TLS_CERT=$TLS_CERT
+Environment=MCP_TLS_KEY=$TLS_KEY
 $TOKEN_ENV
 ExecStart=$PYTHON -u $INSTALL_DIR/server.py --host $BIND_HOST --port $PORT
 Restart=on-failure

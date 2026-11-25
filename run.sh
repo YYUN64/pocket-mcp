@@ -21,6 +21,9 @@ WORKSPACE="${WORKSPACE:-$HOME/pocket-mcp-workspace}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
 TOKEN="${MCP_TOKEN:-}"
 PUBKEY_FILE="${MCP_PUBKEY_FILE:-}"
+TLS_SELFSIGNED="${MCP_TLS_SELFSIGNED:-0}"
+TLS_CERT="${MCP_TLS_CERT:-}"
+TLS_KEY="${MCP_TLS_KEY:-}"
 DATA_DIR="${POCKET_MCP_HOME:-$HOME/.local/share/pocket-mcp}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/YYUN64/pocket-mcp/main}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -47,6 +50,9 @@ while [ $# -gt 0 ]; do
     --token=*) TOKEN="${1#--token=}"; shift ;;
     --pubkey-file) PUBKEY_FILE="${2:?缺少公钥文件路径}"; shift 2 ;;
     --pubkey-file=*) PUBKEY_FILE="${1#--pubkey-file=}"; shift ;;
+    --tls-selfsigned) TLS_SELFSIGNED=1; shift ;;
+    --tls-cert) TLS_CERT="${2:?缺少证书路径}"; shift 2 ;;
+    --tls-key) TLS_KEY="${2:?缺少私钥路径}"; shift 2 ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --daemon) MODE="daemon"; shift ;;
     --stop) MODE="stop"; shift ;;
@@ -122,6 +128,7 @@ if [ "$MODE" = "daemon" ]; then
     die "端口 $PORT 上已有实例在跑（先 $SELF --port $PORT --stop）"
   fi
   MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" MCP_PUBKEY_FILE="$PUBKEY_FILE" \
+    MCP_TLS_SELFSIGNED="$TLS_SELFSIGNED" MCP_TLS_CERT="$TLS_CERT" MCP_TLS_KEY="$TLS_KEY" \
     nohup "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT" >> "$LOG" 2>&1 &
   sleep 1
   info "已在后台启动，日志：$LOG"
@@ -129,5 +136,6 @@ if [ "$MODE" = "daemon" ]; then
 else
   info "前台运行中，Ctrl+C 停止"
   exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" MCP_PUBKEY_FILE="$PUBKEY_FILE" \
+    MCP_TLS_SELFSIGNED="$TLS_SELFSIGNED" MCP_TLS_CERT="$TLS_CERT" MCP_TLS_KEY="$TLS_KEY" \
     "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT"
 fi

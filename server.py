@@ -23,12 +23,14 @@ import errno
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import locale
 import math
 import os
 import re
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -73,6 +75,14 @@ AUTH_ERROR_CODE = -32001
 MCP_PUBKEY_FILE = ""
 SIGNATURE_MAX_SKEW_SECONDS = 300
 SIGNATURE_NONCE_TTL_SECONDS = 300
+
+# TLS：自签或用户提供的证书；空表示不启用
+MCP_TLS_CERT = ""
+MCP_TLS_KEY = ""
+MCP_TLS_SELFSIGNED = False
+MCP_TLS_DIR = ""
+TLS_CERT_FILENAME = "cert.pem"
+TLS_KEY_FILENAME = "key.pem"
 
 # mtime -> {key_id: (n, e)}
 _pubkey_cache: Tuple[float, Dict[str, Tuple[int, int]]] = (-1.0, {})
@@ -1228,8 +1238,7 @@ def rsa_verify_sha256(n: int, e: int, message: bytes, signature: bytes) -> bool:
     return em[sep + 1:] == SIG_DIGEST_INFO_SHA256 + hashlib.sha256(message).digest()
 
 
-def canonical_signature_message(body: bytes, timestamp: str, nonce: str) -> bytes:
-    return (
+def canonical_signature_message(body: bytes, timestamp: str, nonce: str) -> bytes:    return (
         "POST\n/mcp\n"
         + hashlib.sha256(body).hexdigest()
         + "\n"
@@ -1277,6 +1286,55 @@ def verify_request_signature(headers: Any, body: bytes) -> Optional[str]:
             return "nonce 重放"
         _nonce_cache[nonce] = now
     return None
+
+
+# ---------------------------------------------------------------------------
+# TLS（自签或用户证书；只加密链路，客户端身份仍靠请求签名）
+# ---------------------------------------------------------------------------
+
+
+def _read_pem_cert_der(path: str) -> bytes:
+    with open(path, "rb") as handle:
+        data = handle.read()
+    if b"-----BEGIN" in data:
+        body = b"".join(
+            line for line in data.splitlines() if not line.startswith(b"-----")
+        )
+        return base64.b64decode(body)
+    return data
+
+
+def cert_sha256_fingerprint(path: str) -> str:
+    digest = hashlib.sha256(_read_pem_cert_der(path)).hexdigest().upper()
+    return ":".join(digest[index:index + 2] for index in range(0, len(digest), 2))
+
+
+def ensure_selfsigned_cert(host: str, directory: str) -> Tuple[str, str]:
+    target = Path(directory).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    cert = target / TLS_CERT_FILENAME
+    key = target / TLS_KEY_FILENAME
+    if not cert.exists() or not key.exists():
+        command = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+            "-keyout", str(key), "-out", str(cert), "-days", "3650",
+            "-subj", "/CN=%s" % host,
+        ]
+        try:
+            ipaddress.ip_address(host)
+            command += ["-addext", "subjectAltName=IP:%s" % host]
+        except ValueError:
+            command += ["-addext", "subjectAltName=DNS:%s" % host]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise SystemExit(
+                "错误：生成自签证书失败：%s"
+                % (result.stderr.strip() or result.stdout.strip())
+            )
+        os.chmod(str(key), 0o600)
+        os.chmod(str(cert), 0o644)
+        log("已生成自签证书：%s（私钥 %s，权限 600）" % (cert, key))
+    return str(cert), str(key)
 
 
 # ---------------------------------------------------------------------------
@@ -1618,6 +1676,26 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         default=None,
         help="公钥文件（每行一个 base64 SPKI，可带 # 注释）；优先环境变量 MCP_PUBKEY_FILE；为空表示不启用签名鉴权",
     )
+    parser.add_argument(
+        "--tls-selfsigned",
+        action="store_true",
+        help="自动生成自签证书并启用 TLS（存到 MCP_TLS_DIR，默认 ~/.local/share/pocket-mcp/tls/）",
+    )
+    parser.add_argument(
+        "--tls-cert",
+        default=None,
+        help="TLS 证书 PEM（与 --tls-key 一起用；优先环境变量 MCP_TLS_CERT）",
+    )
+    parser.add_argument(
+        "--tls-key",
+        default=None,
+        help="TLS 私钥 PEM（与 --tls-cert 一起用；优先环境变量 MCP_TLS_KEY）",
+    )
+    parser.add_argument(
+        "--tls-dir",
+        default=None,
+        help="自签证书存放目录（优先环境变量 MCP_TLS_DIR）",
+    )
     return parser.parse_args(argv)
 
 
@@ -1639,6 +1717,7 @@ def configure_workspace(args: argparse.Namespace) -> Path:
 
 def main(argv: Optional[List[str]] = None) -> int:
     global WORKSPACE, ALLOW_SHELL, MCP_TOKEN, MCP_PUBKEY_FILE
+    global MCP_TLS_CERT, MCP_TLS_KEY, MCP_TLS_SELFSIGNED, MCP_TLS_DIR
     args = parse_args(argv)
 
     if args.port is not None and args.port_opt is not None and args.port != args.port_opt:
@@ -1678,6 +1757,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             "警告：未设置 MCP_TOKEN / MCP_PUBKEY_FILE，服务器无鉴权！"
             "任何能访问该端口的人都能调用工具，公网部署请务必配置鉴权"
         )
+
+    MCP_TLS_SELFSIGNED = bool(args.tls_selfsigned) or os.environ.get("MCP_TLS_SELFSIGNED") == "1"
+    MCP_TLS_DIR = (
+        os.environ.get("MCP_TLS_DIR") or args.tls_dir or
+        os.path.join(os.path.expanduser("~"), ".local", "share", "pocket-mcp", "tls")
+    )
+    if MCP_TLS_SELFSIGNED:
+        MCP_TLS_CERT, MCP_TLS_KEY = ensure_selfsigned_cert(args.host, MCP_TLS_DIR)
+    else:
+        MCP_TLS_CERT = (os.environ.get("MCP_TLS_CERT") or args.tls_cert or "").strip()
+        MCP_TLS_KEY = (os.environ.get("MCP_TLS_KEY") or args.tls_key or "").strip()
+        if bool(MCP_TLS_CERT) != bool(MCP_TLS_KEY):
+            raise SystemExit("错误：--tls-cert 和 --tls-key 必须同时提供")
+    MCP_TLS_SELFSIGNED = bool(MCP_TLS_CERT and MCP_TLS_KEY)
     log("按 Ctrl+C 停止")
 
     try:
@@ -1701,6 +1794,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             log("错误：无法启动服务器 %s:%d：%s" % (args.host, port, exc))
         return 1
+
+    if MCP_TLS_CERT and MCP_TLS_KEY:
+        try:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(MCP_TLS_CERT, MCP_TLS_KEY)
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+        except (OSError, ssl.SSLError) as exc:
+            log("错误：TLS 初始化失败：%s" % exc)
+            try:
+                httpd.server_close()
+            except Exception:
+                pass
+            return 1
+        log("TLS：已启用（%s，最低 TLS 1.2）" % MCP_TLS_CERT)
+        try:
+            log("证书指纹（SHA-256）：%s" % cert_sha256_fingerprint(MCP_TLS_CERT))
+        except OSError as exc:
+            log("警告：无法读取证书指纹：%s" % exc)
+    else:
+        log("TLS：未启用（明文 HTTP；公网请加 --tls-selfsigned 或 --tls-cert/--tls-key）")
 
     try:
         httpd.serve_forever(poll_interval=0.5)
