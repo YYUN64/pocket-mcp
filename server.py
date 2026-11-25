@@ -204,6 +204,16 @@ def text_result(text: str, is_error: bool = False) -> Dict[str, Any]:
     }
 
 
+# 每次 tools/call 的执行元信息（线程本地，避免并发请求互相覆盖）
+CALL_META = threading.local()
+
+
+def reset_call_meta() -> None:
+    CALL_META.code = None
+    CALL_META.timeout = False
+    CALL_META.dispatched = False
+
+
 def _string_arg(
     arguments: Dict[str, Any],
     name: str,
@@ -715,6 +725,7 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
             env=child_env,
             **popen_kwargs,
         )
+        CALL_META.dispatched = True
     except OSError as exc:
         log("run_command：%s → 启动失败：%s" % (summary, exc))
         raise ToolError("无法启动命令：%s" % exc)
@@ -735,6 +746,9 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
             except (OSError, AttributeError):
                 pass
         elapsed = (time.monotonic() - started_at) * 1000
+        CALL_META.timeout = True
+        CALL_META.code = None
+        CALL_META.timeoutSeconds = int(round(timeout))
         log("run_command：%s → 超时 %.0fs（实际 %.0f ms）" % (summary, timeout, elapsed))
         message = "命令执行超时（%.1f 秒），已终止整个进程组。" % timeout
         if partial:
@@ -747,6 +761,7 @@ def tool_run_command(arguments: Dict[str, Any]) -> str:
     else:
         output = "（无输出）"
     elapsed = (time.monotonic() - started_at) * 1000
+    CALL_META.code = proc.returncode
     log(
         "run_command：%s → 退出码 %d，%.0f ms"
         % (summary, proc.returncode, elapsed)
@@ -1043,18 +1058,38 @@ def call_tool(params: Any) -> Dict[str, Any]:
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return text_result("未知工具：%s" % name, True)
+    reset_call_meta()
+    started_at = time.monotonic()
+
+    def with_meta(result: Dict[str, Any]) -> Dict[str, Any]:
+        elapsed = int((time.monotonic() - started_at) * 1000)
+        meta: Dict[str, Any] = {
+            "dispatched": bool(getattr(CALL_META, "dispatched", False)),
+            "code": getattr(CALL_META, "code", None),
+            "durationMs": elapsed,
+        }
+        if getattr(CALL_META, "timeout", False):
+            meta["timeout"] = True
+            seconds = getattr(CALL_META, "timeoutSeconds", None)
+            if seconds is not None:
+                meta["timeoutSeconds"] = int(seconds)
+        result["_meta"] = meta
+        return result
+
     try:
         result = handler(arguments)
-        return text_result(result, False)
+        if name != "run_command":
+            CALL_META.code = 0
+        return with_meta(text_result(result, False))
     except ToolError as exc:
-        return text_result(str(exc), True)
+        return with_meta(text_result(str(exc), True))
     except Exception as exc:
         log(
             "工具 %s 内部异常：%s\n%s"
             % (one_line(name), one_line(exc), traceback.format_exc())
         )
-        return text_result(
-            "工具内部错误：%s: %s" % (type(exc).__name__, exc), True
+        return with_meta(
+            text_result("工具内部错误：%s: %s" % (type(exc).__name__, exc), True)
         )
 
 
