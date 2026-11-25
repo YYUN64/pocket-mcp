@@ -65,28 +65,44 @@ sudo ./install.sh
 
 > 说明：用户级模式下 `systemd-analyze --user security` 会比系统级差（实测 8.1 EXPOSED vs 4.4 OK）。原因是普通用户的 systemd 没有 `CAP_SYS_ADMIN`/`CAP_SETPCAP`，`PrivateDevices`、`ProtectKernel*`、空的 `CapabilityBoundingSet=` 这类选项会让服务**直接起不来**（`status=218/CAPABILITIES`），所以用户级只保留能用的那部分。用户级的安全边界来自"它就是你自己的权限"，要更强隔离就用系统级。
 
-## 鉴权（token）
+## 鉴权（token / 公钥签名）
 
-服务器默认**不做鉴权**（历史上一直如此），谁连上端口谁就能调用工具。公网部署请务必设置 `MCP_TOKEN`：设置后所有 `/mcp` 请求必须带 `Authorization: Bearer <token>`，不匹配返回 `401` + JSON-RPC error `-32001`。
+服务器默认**不做鉴权**（历史上一直如此），谁连上端口谁就能调用工具。公网部署请至少配置一种：
+
+### 方式一：公钥签名（推荐，客户端私钥不出 Keystore）
+
+App 设置 → MCP 服务器 → 「密钥鉴权」→ 生成/复制公钥（X.509 SPKI base64），追加到服务器的 `/etc/mcp/authorized_keys`（每行一个，`#` 开头是注释）即可，**不用重启**（文件按 mtime 热加载）：
 
 ```bash
-# 1) 生成一个随机 token（64 位十六进制）
+# 服务器上
+sudo mkdir -p /etc/mcp
+sudo tee -a /etc/mcp/authorized_keys <<'KEY'
+# 手机 A
+<把 App 里复制的 base64 公钥粘贴到这里>
+KEY
+```
+
+- 客户端每个请求带 `X-MCP-Key-Id` / `X-MCP-Timestamp` / `X-MCP-Nonce` / `X-MCP-Signature`；
+  签名为 `RSA-SHA256("POST\n/mcp\n" + sha256hex(body) + "\n" + timestamp + "\n" + nonce)`（PKCS#1 v1.5）。
+- 服务端只用标准库验签（`pow(sig,e,n)` + DigestInfo 比对），时间戳 ±300 秒、nonce 5 分钟内不可重放，
+  失败返回 `401` + `-32001`（带“时间戳过期 / nonce 重放 / 未知 key id / 签名不匹配”等原因）。
+- 追加/删除公钥即生效；`--pubkey-file` / `MCP_PUBKEY_FILE` 可改路径（默认 `/etc/mcp/authorized_keys`）。
+
+### 方式二：Bearer token（兼容保留）
+
+设置后 `/mcp` 请求必须带 `Authorization: Bearer <token>`，不匹配返回 `401` + `-32001`。
+
+```bash
 TOKEN="$(openssl rand -hex 32)"
 echo "$TOKEN"
-
-# 2) 直接跑
 MCP_TOKEN="$TOKEN" ./run.sh --daemon
-# 或者
-./run.sh --token "$TOKEN" --daemon
-
-# 3) 装成服务（写进 systemd 的 Environment=MCP_TOKEN=...）
 ./install.sh --user --token "$TOKEN"
 sudo ./install.sh --token "$TOKEN"
 ```
 
-App 侧：设置 → MCP 服务器 → **Token** 填同一个值（留空表示不鉴权）。App 的「测试连接」也会带 token。
+两种方式可以并存：**任一通过即可**。App 里生成了密钥就优先用签名，没有密钥时回退 token。
 
-自测（把 `<token>` 换成你的值）：
+#### 自测
 
 ```bash
 # 没有 token：应返回 401 + -32001
@@ -100,14 +116,17 @@ curl -s -i -X POST http://127.0.0.1:8765/mcp \
   -H 'Authorization: Bearer <token>' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
-# 冒烟测试（有 token 时会额外测“无 token/错误 token -> 401”，并跳过相关用例）
+# 冒烟测试（有 token 时会额外测“无 token/错误 token -> 401”）
 python smoke_test.py http://127.0.0.1:8765 --token '<token>'
+
+# 签名鉴权自测（用 openssl 现生成密钥，覆盖正确/过期/重放/未知 key/篡改 body）
+python signature_test.py --server ./server.py --port 18765
 ```
 
 说明：
 
-- **token 是明文经 HTTP 发送的**：Bearer 头本身不加密，公网直连 `http://IP:9000/mcp` 时任何链路上的节点都能看到 token。公网使用请在前面加 HTTPS 反向代理（如 `nginx` + certbot 免费证书），或用 WireGuard / Tailscale 组网后再走内网地址，不要裸奔 http。
-- token 会写进 systemd 的环境配置文件（`/etc/pocket-mcp/token.env`，权限 600）而不是单元文件本身；不要把带 token 的文件提交到仓库。
+- **token 是明文经 HTTP 发送的**：Bearer 头本身不加密，公网直连 `http://IP:9000/mcp` 时任何链路上的节点都能看到 token。公网使用请在前面加 HTTPS 反向代理（如 `nginx` + certbot 免费证书），或用 WireGuard / Tailscale 组网后再走内网地址，不要裸奔 http。公钥签名方式不传输秘密，但也建议加 TLS。
+- token 会写进 systemd 的环境配置文件（`/etc/mcp/pocket-mcp.env`，权限 600）而不是单元文件本身；公钥文件 `/etc/mcp/authorized_keys` 是公开信息，644 即可。不要把带 token 的文件提交到仓库。
 - 轮换 token：重新执行一次 `./install.sh --token '<新 token>'`（或改环境文件后 `systemctl restart pocket-mcp`），App 里也改成新值。
 - 只监听本机时（`--bind 127.0.0.1` + SSH 隧道）可以不设 token，但一旦对公网开放就必须设。
 

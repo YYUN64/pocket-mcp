@@ -20,6 +20,7 @@ BIND_HOST="${BIND_HOST:-0.0.0.0}"
 WORKSPACE="${WORKSPACE:-$HOME/pocket-mcp-workspace}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
 TOKEN="${MCP_TOKEN:-}"
+PUBKEY_FILE="${MCP_PUBKEY_FILE:-}"
 DATA_DIR="${POCKET_MCP_HOME:-$HOME/.local/share/pocket-mcp}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/YYUN64/pocket-mcp/main}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -44,6 +45,8 @@ while [ $# -gt 0 ]; do
     --workspace) WORKSPACE="${2:?缺少目录}"; shift 2 ;;
     --token) TOKEN="${2:?缺少 token}"; shift 2 ;;
     --token=*) TOKEN="${1#--token=}"; shift ;;
+    --pubkey-file) PUBKEY_FILE="${2:?缺少公钥文件路径}"; shift 2 ;;
+    --pubkey-file=*) PUBKEY_FILE="${1#--pubkey-file=}"; shift ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --daemon) MODE="daemon"; shift ;;
     --stop) MODE="stop"; shift ;;
@@ -118,13 +121,13 @@ if [ "$MODE" = "daemon" ]; then
   if pgrep -f "server.py --host .*--port $PORT" >/dev/null 2>&1; then
     die "端口 $PORT 上已有实例在跑（先 $SELF --port $PORT --stop）"
   fi
-  MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" \
+  MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" MCP_PUBKEY_FILE="$PUBKEY_FILE" \
     nohup "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT" >> "$LOG" 2>&1 &
   sleep 1
   info "已在后台启动，日志：$LOG"
   echo "  停止：$SELF --port $PORT --stop"
 else
   info "前台运行中，Ctrl+C 停止"
-  exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" \
+  exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" MCP_PUBKEY_FILE="$PUBKEY_FILE" \
     "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT"
 fi

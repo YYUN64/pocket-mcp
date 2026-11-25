@@ -21,6 +21,7 @@ PORT="${PORT:-8765}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
 TOKEN="${MCP_TOKEN:-}"
+PUBKEY_FILE="${MCP_PUBKEY_FILE:-/etc/mcp/authorized_keys}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DO_UNINSTALL=0
@@ -45,6 +46,8 @@ while [ $# -gt 0 ]; do
     --workspace) WORKSPACE="${2:?缺少目录}"; shift 2 ;;
     --token) TOKEN="${2:?缺少 token}"; shift 2 ;;
     --token=*) TOKEN="${1#--token=}"; shift ;;
+    --pubkey-file) PUBKEY_FILE="${2:?缺少公钥文件路径}"; shift 2 ;;
+    --pubkey-file=*) PUBKEY_FILE="${1#--pubkey-file=}"; shift ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --open-firewall) OPEN_FIREWALL=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
@@ -218,10 +221,19 @@ if [ -n "$TOKEN" ]; then
 else
   info "鉴权：未设置 token；公网部署请用 --token 或 MCP_TOKEN，否则任何人都能调用工具"
 fi
+# 公钥文件：不存在就建一个空文件（644，公钥不是秘密），后续往里追加 base64 SPKI
+mkdir -p "$(dirname "$PUBKEY_FILE")"
+if [ ! -f "$PUBKEY_FILE" ]; then
+  : > "$PUBKEY_FILE"
+  chmod 644 "$PUBKEY_FILE"
+  info "已创建公钥文件 $PUBKEY_FILE（当前为空，把 App 里复制的公钥追加进去）"
+fi
+info "签名鉴权：公钥文件 $PUBKEY_FILE"
 cat > "$UNIT_PATH" <<EOF
 $UNIT_HEADER
 Environment=MCP_WORKSPACE=$WORKSPACE
 Environment=MCP_ALLOW_SHELL=$ALLOW_SHELL
+Environment=MCP_PUBKEY_FILE=$PUBKEY_FILE
 $TOKEN_ENV
 ExecStart=$PYTHON -u $INSTALL_DIR/server.py --host $BIND_HOST --port $PORT
 Restart=on-failure
@@ -236,7 +248,10 @@ EOF
 chmod 0644 "$UNIT_PATH"
 "${SYSTEMCTL[@]}" daemon-reload
 "${SYSTEMCTL[@]}" enable --now "$SERVICE_NAME" >/dev/null
-ok "systemd 已启用：$SERVICE_NAME$( [ "$USER_MODE" -eq 1 ] && echo "（用户级）")"
+# 覆盖升级时 enable --now 不会重启已在跑的服务：显式 restart 保证新 server.py 生效
+"${SYSTEMCTL[@]}" restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+ok "systemd 已启用并重启：$SERVICE_NAME$( [ "$USER_MODE" -eq 1 ] && echo "（用户级）")"
+info "生效路径：$UNIT_PATH（$([ "$USER_MODE" -eq 1 ] && echo 用户级 || echo 系统级)）"
 
 # 4. 启动自检
 READY=0

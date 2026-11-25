@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import datetime
 import errno
+import hashlib
 import hmac
 import html
 import json
@@ -29,6 +31,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import urllib.error
@@ -66,6 +69,17 @@ ALLOW_SHELL = False
 # Empty means "no auth" (the historical behaviour).  Set by --token / MCP_TOKEN.
 MCP_TOKEN = ""
 AUTH_ERROR_CODE = -32001
+# 公钥文件（每行一个 base64 SPKI，可带 # 注释）；为空表示不启用签名鉴权
+MCP_PUBKEY_FILE = ""
+SIGNATURE_MAX_SKEW_SECONDS = 300
+SIGNATURE_NONCE_TTL_SECONDS = 300
+
+# mtime -> {key_id: (n, e)}
+_pubkey_cache: Tuple[float, Dict[str, Tuple[int, int]]] = (-1.0, {})
+_pubkey_lock = threading.Lock()
+# nonce -> 首次出现时间（只在验签成功后记录）
+_nonce_cache: Dict[str, float] = {}
+_nonce_lock = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -1102,6 +1116,163 @@ def process_rpc(message: Any) -> Tuple[int, Optional[Dict[str, Any]], str]:
 
 
 # ---------------------------------------------------------------------------
+# 签名鉴权（RSA-2048 + PKCS#1 v1.5 + SHA-256，纯标准库；服务端只存公钥）
+# ---------------------------------------------------------------------------
+
+SIG_DIGEST_INFO_SHA256 = bytes.fromhex("3031300d060960864801650304020105000420")
+
+
+def _der_tlv(data: bytes, offset: int) -> Tuple[int, bytes, int]:
+    if offset + 2 > len(data):
+        raise ValueError("truncated TLV")
+    tag = data[offset]
+    length_byte = data[offset + 1]
+    offset += 2
+    if length_byte & 0x80:
+        count = length_byte & 0x7F
+        if count == 0 or count > 4 or offset + count > len(data):
+            raise ValueError("bad length")
+        length = int.from_bytes(data[offset:offset + count], "big")
+        offset += count
+    else:
+        length = length_byte
+    end = offset + length
+    if end > len(data):
+        raise ValueError("truncated value")
+    return tag, data[offset:end], end
+
+
+def parse_rsa_spki(der: bytes) -> Tuple[int, int]:
+    """从 X.509 SubjectPublicKeyInfo（DER）里取出 RSA 的 (n, e)。"""
+    tag, body, _ = _der_tlv(der, 0)
+    if tag != 0x30:
+        raise ValueError("SPKI is not a SEQUENCE")
+    tag_alg, _alg, offset = _der_tlv(body, 0)
+    if tag_alg != 0x30:
+        raise ValueError("missing algorithm")
+    tag_bits, bit_string, _ = _der_tlv(body, offset)
+    if tag_bits != 0x03 or not bit_string or bit_string[0] != 0:
+        raise ValueError("bad subjectPublicKey")
+    tag_seq, seq, _ = _der_tlv(bit_string, 1)
+    if tag_seq != 0x30:
+        raise ValueError("bad RSAPublicKey")
+    tag_n, n_bytes, offset = _der_tlv(seq, 0)
+    tag_e, e_bytes, _ = _der_tlv(seq, offset)
+    if tag_n != 0x02 or tag_e != 0x02:
+        raise ValueError("bad RSAPublicKey integers")
+    n = int.from_bytes(n_bytes, "big")
+    e = int.from_bytes(e_bytes, "big")
+    if n <= 0 or e <= 0:
+        raise ValueError("invalid RSA key")
+    return n, e
+
+
+def pubkey_id(spki: bytes) -> str:
+    return hashlib.sha256(spki).hexdigest()[:16]
+
+
+def load_pubkeys() -> Dict[str, Tuple[int, int]]:
+    """读取 authorized_keys 风格公钥文件；按 mtime 缓存，改文件后无需重启。"""
+    global _pubkey_cache
+    if not MCP_PUBKEY_FILE:
+        return {}
+    try:
+        mtime = os.stat(MCP_PUBKEY_FILE).st_mtime
+    except OSError:
+        return {}
+    with _pubkey_lock:
+        if _pubkey_cache[0] == mtime:
+            return _pubkey_cache[1]
+        keys: Dict[str, Tuple[int, int]] = {}
+        try:
+            with open(MCP_PUBKEY_FILE, "r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    try:
+                        spki = base64.b64decode(line, validate=True)
+                        n, e = parse_rsa_spki(spki)
+                    except Exception:
+                        continue
+                    keys[pubkey_id(spki)] = (n, e)
+        except OSError:
+            keys = {}
+        _pubkey_cache = (mtime, keys)
+        return keys
+
+
+def rsa_verify_sha256(n: int, e: int, message: bytes, signature: bytes) -> bool:
+    size = (n.bit_length() + 7) // 8
+    if len(signature) != size:
+        return False
+    m = int.from_bytes(signature, "big")
+    if m >= n:
+        return False
+    em = pow(m, e, n).to_bytes(size, "big")
+    if len(em) < 11 or em[0] != 0x00 or em[1] != 0x01:
+        return False
+    try:
+        sep = em.index(b"\x00", 2)
+    except ValueError:
+        return False
+    if sep < 10 or any(byte != 0xFF for byte in em[2:sep]):
+        return False
+    return em[sep + 1:] == SIG_DIGEST_INFO_SHA256 + hashlib.sha256(message).digest()
+
+
+def canonical_signature_message(body: bytes, timestamp: str, nonce: str) -> bytes:
+    return (
+        "POST\n/mcp\n"
+        + hashlib.sha256(body).hexdigest()
+        + "\n"
+        + timestamp
+        + "\n"
+        + nonce
+    ).encode("utf-8")
+
+
+def verify_request_signature(headers: Any, body: bytes) -> Optional[str]:
+    """None = 通过；否则返回失败原因。"""
+    key_id = headers.get("X-MCP-Key-Id", "").strip()
+    timestamp = headers.get("X-MCP-Timestamp", "").strip()
+    nonce = headers.get("X-MCP-Nonce", "").strip()
+    signature_b64 = headers.get("X-MCP-Signature", "").strip()
+    if not (key_id and timestamp and nonce and signature_b64):
+        return "缺少签名头"
+    try:
+        seconds = int(timestamp)
+    except ValueError:
+        return "时间戳不是整数"
+    if abs(time.time() - seconds) > SIGNATURE_MAX_SKEW_SECONDS:
+        return "时间戳过期（允许 ±%d 秒）" % SIGNATURE_MAX_SKEW_SECONDS
+    if len(nonce) < 16 or len(nonce) > 128:
+        return "nonce 长度不合法"
+    keys = load_pubkeys()
+    if not keys:
+        return "服务器没有配置公钥"
+    key = keys.get(key_id)
+    if key is None:
+        return "未知的 key id"
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except Exception:
+        return "签名不是合法 base64"
+    message = canonical_signature_message(body, timestamp, nonce)
+    if not rsa_verify_sha256(key[0], key[1], message, signature):
+        return "签名不匹配"
+    now = time.time()
+    with _nonce_lock:
+        for old_nonce, seen_at in list(_nonce_cache.items()):
+            if now - seen_at > SIGNATURE_NONCE_TTL_SECONDS:
+                del _nonce_cache[old_nonce]
+        if nonce in _nonce_cache:
+            return "nonce 重放"
+        _nonce_cache[nonce] = now
+    return None
+
+
+# ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
 
@@ -1216,7 +1387,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 % SERVER_VERSION,
             )
         elif path == "/mcp":
-            auth = self._check_auth()
+            auth = self._check_auth(b"")
             if auth is not None:
                 status = auth
             else:
@@ -1232,29 +1403,43 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             )
         self._log_access("GET", path, status, "-", started)
 
-    def _check_auth(self) -> Optional[int]:
-        """No token configured -> open.  Otherwise require a Bearer token.
+    def _check_auth(self, body: bytes) -> Optional[int]:
+        """签名公钥 / Bearer token 任一通过即可；都没配置则保持开放。
 
         Returns None when the request may proceed, or the 401 status after
         sending a JSON-RPC error response.
         """
-        if not MCP_TOKEN:
+        has_pubkeys = bool(load_pubkeys())
+        if not MCP_TOKEN and not has_pubkeys:
             return None
-        header = self.headers.get("Authorization", "").strip()
-        parts = header.split(None, 1)
-        if len(parts) == 2 and parts[0].lower() == "bearer":
-            supplied = parts[1].strip()
-            if hmac.compare_digest(
-                supplied.encode("utf-8", "replace"), MCP_TOKEN.encode("utf-8")
-            ):
+        signature_reason: Optional[str] = None
+        if self.headers.get("X-MCP-Signature"):
+            signature_reason = verify_request_signature(self.headers, body)
+            if signature_reason is None:
+                log(
+                    "签名鉴权通过 key_id=%s"
+                    % one_line(self.headers.get("X-MCP-Key-Id", ""), 32)
+                )
                 return None
+        if MCP_TOKEN:
+            header = self.headers.get("Authorization", "").strip()
+            parts = header.split(None, 1)
+            if len(parts) == 2 and parts[0].lower() == "bearer":
+                supplied = parts[1].strip()
+                if hmac.compare_digest(
+                    supplied.encode("utf-8", "replace"), MCP_TOKEN.encode("utf-8")
+                ):
+                    log("token 鉴权通过")
+                    return None
+        if signature_reason is not None:
+            message = "签名鉴权失败：%s" % signature_reason
+        elif has_pubkeys and not MCP_TOKEN:
+            message = "需要签名：请带上 X-MCP-Key-Id / X-MCP-Timestamp / X-MCP-Nonce / X-MCP-Signature"
+        else:
+            message = "需要 token：请在 Authorization 头里携带 Bearer <MCP_TOKEN>，或使用请求签名"
         return self._send_json(
             401,
-            rpc_error(
-                None,
-                AUTH_ERROR_CODE,
-                "需要 token：请在 Authorization 头里携带 Bearer <MCP_TOKEN>",
-            ),
+            rpc_error(None, AUTH_ERROR_CODE, message),
         )
 
     def _discard_request_body(self, length: int) -> None:
@@ -1275,7 +1460,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             pass
 
-    def _read_json_body(self) -> Any:
+    def _read_body_bytes(self) -> bytes:
         raw_length = self.headers.get("Content-Length")
         if raw_length is None:
             raise RequestProblem(400, "缺少 Content-Length 请求头")
@@ -1294,6 +1479,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         body = self.rfile.read(length)
         if len(body) != length:
             raise RequestProblem(400, "请求体不完整", parse_error=True)
+        return body
+
+    def _parse_json_body(self, body: bytes) -> Any:
         try:
             text = body.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
@@ -1314,11 +1502,23 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 self._send_text(404, "Not found. The MCP endpoint is POST /mcp.\n"),
                 "-",
             )
-        auth = self._check_auth()
+        try:
+            body = self._read_body_bytes()
+        except RequestProblem as exc:
+            if exc.parse_error:
+                return (
+                    self._send_json(
+                        exc.status,
+                        rpc_error(None, -32700, "Parse error: " + exc.message),
+                    ),
+                    "(parse-error)",
+                )
+            return self._send_text(exc.status, exc.message + "\n"), "(body)"
+        auth = self._check_auth(body)
         if auth is not None:
             return auth, "(auth)"
         try:
-            message = self._read_json_body()
+            message = self._parse_json_body(body)
         except RequestProblem as exc:
             if exc.parse_error:
                 return (
@@ -1406,6 +1606,11 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         default=None,
         help="MCP 鉴权 token（也可用环境变量 MCP_TOKEN）；留空表示不鉴权",
     )
+    parser.add_argument(
+        "--pubkey-file",
+        default=None,
+        help="公钥文件（每行一个 base64 SPKI，可带 # 注释）；优先环境变量 MCP_PUBKEY_FILE；为空表示不启用签名鉴权",
+    )
     return parser.parse_args(argv)
 
 
@@ -1426,7 +1631,7 @@ def configure_workspace(args: argparse.Namespace) -> Path:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    global WORKSPACE, ALLOW_SHELL, MCP_TOKEN
+    global WORKSPACE, ALLOW_SHELL, MCP_TOKEN, MCP_PUBKEY_FILE
     args = parse_args(argv)
 
     if args.port is not None and args.port_opt is not None and args.port != args.port_opt:
@@ -1445,17 +1650,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     WORKSPACE = configure_workspace(args)
     ALLOW_SHELL = os.environ.get("MCP_ALLOW_SHELL", "") == "1"
     MCP_TOKEN = (os.environ.get("MCP_TOKEN") or args.token or "").strip()
+    MCP_PUBKEY_FILE = (
+        os.environ.get("MCP_PUBKEY_FILE") or args.pubkey_file or ""
+    ).strip()
 
     log("deepseek-lite-mcp %s" % SERVER_VERSION)
     log("监听：%s:%d（MCP 端点 http://<服务器IP>:%d/mcp）" % (args.host, port, port))
     log("工作区：%s" % WORKSPACE)
     log("run_command：%s" % ("已启用（MCP_ALLOW_SHELL=1）" if ALLOW_SHELL else "已禁用"))
     if MCP_TOKEN:
-        log("鉴权：已启用（Authorization: Bearer <token>，token 长度 %d）" % len(MCP_TOKEN))
-    else:
+        log("鉴权：Bearer token 已启用（token 长度 %d）" % len(MCP_TOKEN))
+    if MCP_PUBKEY_FILE:
+        keys = load_pubkeys()
         log(
-            "警告：未设置 MCP_TOKEN，服务器无鉴权！"
-            "任何能访问该端口的人都能调用工具，公网部署请务必设置 token"
+            "签名鉴权：%s（%d 把公钥）"
+            % (MCP_PUBKEY_FILE, len(keys))
+        )
+    if not MCP_TOKEN and not MCP_PUBKEY_FILE:
+        log(
+            "警告：未设置 MCP_TOKEN / MCP_PUBKEY_FILE，服务器无鉴权！"
+            "任何能访问该端口的人都能调用工具，公网部署请务必配置鉴权"
         )
     log("按 Ctrl+C 停止")
 
