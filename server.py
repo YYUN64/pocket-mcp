@@ -19,6 +19,7 @@ import argparse
 import ast
 import datetime
 import errno
+import hmac
 import html
 import json
 import locale
@@ -61,6 +62,9 @@ USER_AGENT = "deepseek-lite-mcp/1.0.0"
 # Configured in main(); all request handlers read these module-level values.
 WORKSPACE = Path.cwd().resolve()
 ALLOW_SHELL = False
+# Empty means "no auth" (the historical behaviour).  Set by --token / MCP_TOKEN.
+MCP_TOKEN = ""
+AUTH_ERROR_CODE = -32001
 
 
 def log(message: str) -> None:
@@ -1172,17 +1176,46 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 % SERVER_VERSION,
             )
         elif path == "/mcp":
-            status = self._send_text(
-                405,
-                "GET is not supported here. Send a JSON-RPC POST to /mcp.\n",
-                {"Allow": "POST"},
-            )
+            auth = self._check_auth()
+            if auth is not None:
+                status = auth
+            else:
+                status = self._send_text(
+                    405,
+                    "GET is not supported here. Send a JSON-RPC POST to /mcp.\n",
+                    {"Allow": "POST"},
+                )
         else:
             status = self._send_text(
                 404,
                 "Not found. The MCP endpoint is POST /mcp.\n",
             )
         self._log_access("GET", path, status, "-", started)
+
+    def _check_auth(self) -> Optional[int]:
+        """No token configured -> open.  Otherwise require a Bearer token.
+
+        Returns None when the request may proceed, or the 401 status after
+        sending a JSON-RPC error response.
+        """
+        if not MCP_TOKEN:
+            return None
+        header = self.headers.get("Authorization", "").strip()
+        parts = header.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            supplied = parts[1].strip()
+            if hmac.compare_digest(
+                supplied.encode("utf-8", "replace"), MCP_TOKEN.encode("utf-8")
+            ):
+                return None
+        return self._send_json(
+            401,
+            rpc_error(
+                None,
+                AUTH_ERROR_CODE,
+                "需要 token：请在 Authorization 头里携带 Bearer <MCP_TOKEN>",
+            ),
+        )
 
     def _discard_request_body(self, length: int) -> None:
         """Drain an oversized body so the client can receive our 400 response.
@@ -1241,6 +1274,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 self._send_text(404, "Not found. The MCP endpoint is POST /mcp.\n"),
                 "-",
             )
+        auth = self._check_auth()
+        if auth is not None:
+            return auth, "(auth)"
         try:
             message = self._read_json_body()
         except RequestProblem as exc:
@@ -1325,6 +1361,11 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         default=None,
         help="工作区根目录；优先使用环境变量 MCP_WORKSPACE，其次此参数，最后当前目录",
     )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="MCP 鉴权 token（也可用环境变量 MCP_TOKEN）；留空表示不鉴权",
+    )
     return parser.parse_args(argv)
 
 
@@ -1345,7 +1386,7 @@ def configure_workspace(args: argparse.Namespace) -> Path:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    global WORKSPACE, ALLOW_SHELL
+    global WORKSPACE, ALLOW_SHELL, MCP_TOKEN
     args = parse_args(argv)
 
     if args.port is not None and args.port_opt is not None and args.port != args.port_opt:
@@ -1363,11 +1404,19 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     WORKSPACE = configure_workspace(args)
     ALLOW_SHELL = os.environ.get("MCP_ALLOW_SHELL", "") == "1"
+    MCP_TOKEN = (os.environ.get("MCP_TOKEN") or args.token or "").strip()
 
     log("deepseek-lite-mcp %s" % SERVER_VERSION)
     log("监听：%s:%d（MCP 端点 http://<服务器IP>:%d/mcp）" % (args.host, port, port))
     log("工作区：%s" % WORKSPACE)
     log("run_command：%s" % ("已启用（MCP_ALLOW_SHELL=1）" if ALLOW_SHELL else "已禁用"))
+    if MCP_TOKEN:
+        log("鉴权：已启用（Authorization: Bearer <token>，token 长度 %d）" % len(MCP_TOKEN))
+    else:
+        log(
+            "警告：未设置 MCP_TOKEN，服务器无鉴权！"
+            "任何能访问该端口的人都能调用工具，公网部署请务必设置 token"
+        )
     log("按 Ctrl+C 停止")
 
     try:

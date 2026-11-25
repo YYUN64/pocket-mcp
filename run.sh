@@ -7,6 +7,7 @@
 # 本地已 clone 时：
 #   ./run.sh                      # 前台运行，默认 0.0.0.0:8765
 #   ./run.sh --port 9000
+#   ./run.sh --token <token>      # 启用鉴权（也可用环境变量 MCP_TOKEN）
 #   ./run.sh --daemon             # 后台运行，日志在 ~/.local/share/pocket-mcp/server.log
 #   ./run.sh --stop               # 停止后台实例
 #   ./run.sh --workspace ~/notes  # 文件工具只能访问这个目录
@@ -18,6 +19,7 @@ PORT="${PORT:-8765}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
 WORKSPACE="${WORKSPACE:-$HOME/pocket-mcp-workspace}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
+TOKEN="${MCP_TOKEN:-}"
 DATA_DIR="${POCKET_MCP_HOME:-$HOME/.local/share/pocket-mcp}"
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/YYUN64/pocket-mcp/main}"
 PYTHON_BIN="${PYTHON_BIN:-}"
@@ -40,6 +42,8 @@ while [ $# -gt 0 ]; do
     --port) PORT="${2:?缺少端口}"; shift 2 ;;
     --bind|--host) BIND_HOST="${2:?缺少地址}"; shift 2 ;;
     --workspace) WORKSPACE="${2:?缺少目录}"; shift 2 ;;
+    --token) TOKEN="${2:?缺少 token}"; shift 2 ;;
+    --token=*) TOKEN="${1#--token=}"; shift ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --daemon) MODE="daemon"; shift ;;
     --stop) MODE="stop"; shift ;;
@@ -102,6 +106,11 @@ SERVER="$(resolve_server)"
 mkdir -p "$WORKSPACE"
 
 info "Python: $PYTHON / 端口: $PORT / 工作区: $WORKSPACE / 用户: $(id -un)"
+if [ -n "$TOKEN" ]; then
+  info "鉴权：已启用（Authorization: Bearer <token>）"
+else
+  info "鉴权：未设置 token（公网部署请加 --token 或 MCP_TOKEN）"
+fi
 
 if [ "$MODE" = "daemon" ]; then
   mkdir -p "$DATA_DIR"
@@ -109,13 +118,13 @@ if [ "$MODE" = "daemon" ]; then
   if pgrep -f "server.py --host .*--port $PORT" >/dev/null 2>&1; then
     die "端口 $PORT 上已有实例在跑（先 $SELF --port $PORT --stop）"
   fi
-  MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" \
+  MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" \
     nohup "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT" >> "$LOG" 2>&1 &
   sleep 1
   info "已在后台启动，日志：$LOG"
   echo "  停止：$SELF --port $PORT --stop"
 else
   info "前台运行中，Ctrl+C 停止"
-  exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" \
+  exec env MCP_WORKSPACE="$WORKSPACE" MCP_ALLOW_SHELL="$ALLOW_SHELL" MCP_TOKEN="$TOKEN" \
     "$PYTHON" -u "$SERVER" --host "$BIND_HOST" --port "$PORT"
 fi

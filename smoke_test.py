@@ -42,7 +42,7 @@ def short(value: Any, limit: int = 300) -> str:
 
 
 class MCPClient:
-    def __init__(self, base_url: str, timeout: float = 30.0) -> None:
+    def __init__(self, base_url: str, timeout: float = 30.0, token: str = "") -> None:
         base_url = base_url.rstrip("/")
         if base_url.endswith("/mcp"):
             self.endpoint = base_url
@@ -51,13 +51,21 @@ class MCPClient:
             self.endpoint = base_url + "/mcp"
         self.base_url = base_url
         self.timeout = timeout
+        self.token = token.strip()
         self._next_id = 1
 
-    def raw_post(self, body: bytes) -> Tuple[int, Dict[str, str], str]:
+    def _headers(self, token: Optional[str] = None) -> Dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        effective = self.token if token is None else token.strip()
+        if effective:
+            headers["Authorization"] = "Bearer " + effective
+        return headers
+
+    def raw_post(self, body: bytes, token: Optional[str] = None) -> Tuple[int, Dict[str, str], str]:
         request = urllib.request.Request(
             self.endpoint,
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers=self._headers(token),
             method="POST",
         )
         try:
@@ -73,8 +81,10 @@ class MCPClient:
 
     def get(self, path: str = "/") -> Tuple[int, str]:
         url = self.base_url + path
+        headers = {"Authorization": "Bearer " + self.token} if self.token else {}
+        request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(url, timeout=self.timeout) as response:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return response.getcode(), response.read().decode(
                     "utf-8", errors="replace"
                 )
@@ -151,9 +161,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="把 http_fetch 网络失败视为测试失败（默认记为 SKIP）",
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP 超时秒数")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("MCP_TOKEN", ""),
+        help="服务器设置了 MCP_TOKEN 时传入；会额外测试“无 token/错误 token -> 401”",
+    )
     args = parser.parse_args(argv)
 
-    client = MCPClient(args.base_url, timeout=args.timeout)
+    client = MCPClient(args.base_url, timeout=args.timeout, token=args.token)
     passed = 0
     failed = 0
     skipped = 0
@@ -407,6 +422,40 @@ def main(argv: Optional[List[str]] = None) -> int:
         require(error.get("code") == -32700, "invalid JSON code is not -32700: %s" % short(parsed))
         return "HTTP 400, -32700"
 
+    def check_auth_required() -> str:
+        body = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 9001,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "smoke-test", "version": "1.0"},
+                },
+            }
+        ).encode("utf-8")
+        status, _headers, text = client.raw_post(body, token="")
+        require(status == 401, "no-token request returned HTTP %d, expected 401" % status)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            raise CheckFailure("no-token response is not JSON: %s" % short(text))
+        error = parsed.get("error") if isinstance(parsed, dict) else None
+        require(isinstance(error, dict), "no-token response has no JSON-RPC error")
+        require(
+            error.get("code") == -32001,
+            "no-token error code is not -32001: %s" % short(text),
+        )
+        wrong = (args.token + "-wrong") if args.token else "wrong"
+        status2, _headers2, text2 = client.raw_post(body, token=wrong)
+        require(
+            status2 == 401,
+            "wrong-token request returned HTTP %d, expected 401: %s"
+            % (status2, short(text2)),
+        )
+        return "401 + -32001 for missing and wrong token"
+
     run("GET / help page", check_http_root)
     run("initialize", check_initialize)
     run("notifications/initialized", check_initialized_notification)
@@ -422,6 +471,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     run("tools/call http_fetch", check_http_fetch)
     run("unknown method -> -32601", check_unknown_method)
     run("invalid JSON -> 400/-32700", check_invalid_json)
+    if args.token:
+        run("auth: missing/wrong token -> 401/-32001", check_auth_required)
+    else:
+        skipped += 1
+        print("[SKIP] auth: missing/wrong token（未提供 --token）", flush=True)
 
     print("=" * 70, flush=True)
     print(

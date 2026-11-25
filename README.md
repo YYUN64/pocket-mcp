@@ -65,13 +65,58 @@ sudo ./install.sh
 
 > 说明：用户级模式下 `systemd-analyze --user security` 会比系统级差（实测 8.1 EXPOSED vs 4.4 OK）。原因是普通用户的 systemd 没有 `CAP_SYS_ADMIN`/`CAP_SETPCAP`，`PrivateDevices`、`ProtectKernel*`、空的 `CapabilityBoundingSet=` 这类选项会让服务**直接起不来**（`status=218/CAPABILITIES`），所以用户级只保留能用的那部分。用户级的安全边界来自"它就是你自己的权限"，要更强隔离就用系统级。
 
+## 鉴权（token）
+
+服务器默认**不做鉴权**（历史上一直如此），谁连上端口谁就能调用工具。公网部署请务必设置 `MCP_TOKEN`：设置后所有 `/mcp` 请求必须带 `Authorization: Bearer <token>`，不匹配返回 `401` + JSON-RPC error `-32001`。
+
+```bash
+# 1) 生成一个随机 token（64 位十六进制）
+TOKEN="$(openssl rand -hex 32)"
+echo "$TOKEN"
+
+# 2) 直接跑
+MCP_TOKEN="$TOKEN" ./run.sh --daemon
+# 或者
+./run.sh --token "$TOKEN" --daemon
+
+# 3) 装成服务（写进 systemd 的 Environment=MCP_TOKEN=...）
+./install.sh --user --token "$TOKEN"
+sudo ./install.sh --token "$TOKEN"
+```
+
+App 侧：设置 → MCP 服务器 → **Token** 填同一个值（留空表示不鉴权）。App 的「测试连接」也会带 token。
+
+自测（把 `<token>` 换成你的值）：
+
+```bash
+# 没有 token：应返回 401 + -32001
+curl -s -i -X POST http://127.0.0.1:8765/mcp \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# 带正确 token：应返回 200 + result
+curl -s -i -X POST http://127.0.0.1:8765/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# 冒烟测试（有 token 时会额外测“无 token/错误 token -> 401”，并跳过相关用例）
+python smoke_test.py http://127.0.0.1:8765 --token '<token>'
+```
+
+说明：
+
+- token 会写进 systemd 单元（`Environment=MCP_TOKEN=...`），单元文件对 root 可见；不要把带 token 的单元文件提交到仓库。
+- 轮换 token：重新执行一次 `./install.sh --token '<新 token>'`（或改 `MCP_TOKEN` 后重启服务），App 里也改成新值。
+- 只监听本机时（`--bind 127.0.0.1` + SSH 隧道）可以不设 token，但一旦对公网开放就必须设。
+
 ## 安全模型（为什么不该用 root）
 
 | 风险点 | 说明 |
 | --- | --- |
 | `run_command` | **默认禁用**。一旦 `--allow-shell` 打开，等于给这个用户一个远程 shell；若服务以 root 跑，那就是**公网 root shell** |
 | 文件工具 | 只能读写 `MCP_WORKSPACE` 内的路径（resolve 后校验，`../` 越界被拒）；如果把工作区设成 `/`，等于全盘可读写 |
-| 无鉴权 | 服务器本身没有账号密码/token，**谁连上谁就能用**，所以不要裸奔在公网 |
+| 无鉴权 | 服务器默认没有账号密码，**谁连上谁就能用**；公网部署请设置 `MCP_TOKEN`（见上一节），否则不要裸奔在公网 |
 
 部署方式按安全性从高到低：
 
@@ -460,7 +505,7 @@ python3 smoke_test.py http://127.0.0.1:8765 --strict-http
 名称：任意，例如 DeepSeek Lite
 地址/URL：http://192.168.1.23:8765/mcp
 传输方式：Streamable HTTP / HTTP（JSON）
-认证：无 / 留空
+认证：无 / 留空（服务器设了 MCP_TOKEN 时填同一个 token）
 ```
 
 如果 App 要求分别填写 IP 和端口：
@@ -507,8 +552,8 @@ IP：192.168.1.23
 
 ## 10. 安全注意事项（务必阅读）
 
-1. **没有身份认证，也没有 TLS。** 任何能访问 `IP:8765` 的人都可以读取/写入工作区。仅限可信局域网使用。
-2. **不要做公网端口映射。** 如果确实需要公网访问，请在前面加 HTTPS 反向代理，并配置认证、访问控制和来源 IP 限制。
+1. **默认没有身份认证（可以用 `MCP_TOKEN` 开启 Bearer token），也没有 TLS。** 不设 token 时任何能访问 `IP:8765` 的人都可以读取/写入工作区。公网/不可信网络请设置 token，并尽量再加 TLS。
+2. **不要裸奔公网端口映射。** 确实需要公网访问时，请设置 `MCP_TOKEN`，并在前面加 HTTPS 反向代理 + 来源 IP 限制。
 3. **`run_command` 默认关闭。** 设置 `MCP_ALLOW_SHELL=1` 后，任何能访问端口的人都等同于拥有一个 shell；没有命令白名单。仅在临时调试时开启，用完关闭并重启。
 4. **使用低权限专用用户运行**，不要把工作区设成 `/`、`/etc`、用户主目录或包含密钥/凭据的目录。`MCP_WORKSPACE` 应该是一个专用空目录。
 5. `list_dir` / `read_file` / `write_file` / `search_files` 会校验路径是否在工作区内，并尽量拒绝指向工作区外的符号链接；但它不是操作系统级沙箱，写入前仍有极小的 TOCTOU 竞态窗口，不能把它当作对抗恶意客户端的隔离机制。

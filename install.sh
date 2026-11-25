@@ -8,8 +8,8 @@
 # 只想跑起来、不装服务？直接用 ./run.sh（完全不需要 root）。
 #
 # 用法：
-#   ./install.sh --user [--port 8765] [--workspace ~/mcp] [--allow-shell]
-#   sudo ./install.sh [--port 8765] [--workspace /srv/mcp] [--bind 127.0.0.1]
+#   ./install.sh --user [--port 8765] [--workspace ~/mcp] [--token <token>] [--allow-shell]
+#   sudo ./install.sh [--port 8765] [--workspace /srv/mcp] [--bind 127.0.0.1] [--token <token>]
 #   ./install.sh --uninstall            # 按之前的模式卸载（--user 需带 --user）
 set -euo pipefail
 
@@ -20,6 +20,7 @@ WORKSPACE="${WORKSPACE:-}"
 PORT="${PORT:-8765}"
 BIND_HOST="${BIND_HOST:-0.0.0.0}"
 ALLOW_SHELL="${ALLOW_SHELL:-0}"
+TOKEN="${MCP_TOKEN:-}"
 OPEN_FIREWALL="${OPEN_FIREWALL:-0}"
 PYTHON_BIN="${PYTHON_BIN:-}"
 DO_UNINSTALL=0
@@ -42,6 +43,8 @@ while [ $# -gt 0 ]; do
     --port) PORT="${2:?缺少端口值}"; shift 2 ;;
     --bind|--host) BIND_HOST="${2:?缺少地址}"; shift 2 ;;
     --workspace) WORKSPACE="${2:?缺少目录}"; shift 2 ;;
+    --token) TOKEN="${2:?缺少 token}"; shift 2 ;;
+    --token=*) TOKEN="${1#--token=}"; shift ;;
     --allow-shell) ALLOW_SHELL=1; shift ;;
     --open-firewall) OPEN_FIREWALL=1; shift ;;
     --uninstall) DO_UNINSTALL=1; shift ;;
@@ -208,10 +211,18 @@ else
 fi
 
 mkdir -p "$(dirname "$UNIT_PATH")"
+TOKEN_ENV=""
+if [ -n "$TOKEN" ]; then
+  TOKEN_ENV="Environment=MCP_TOKEN=$TOKEN"
+  info "鉴权：已启用（systemd 环境变量 MCP_TOKEN）"
+else
+  info "鉴权：未设置 token；公网部署请用 --token 或 MCP_TOKEN，否则任何人都能调用工具"
+fi
 cat > "$UNIT_PATH" <<EOF
 $UNIT_HEADER
 Environment=MCP_WORKSPACE=$WORKSPACE
 Environment=MCP_ALLOW_SHELL=$ALLOW_SHELL
+$TOKEN_ENV
 ExecStart=$PYTHON -u $INSTALL_DIR/server.py --host $BIND_HOST --port $PORT
 Restart=on-failure
 RestartSec=2
