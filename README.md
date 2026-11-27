@@ -715,6 +715,34 @@ set PYTHONIOENCODING=utf-8
 
 ---
 
+## 高并发与隔夜稳定性（建议部署后照做）
+
+`server.py` 已把监听 backlog 调到 512（Python 默认只有 5，客户端并发连接多时会被内核静默丢弃，
+表现为「服务看着正常、但连不上，重启服务端才好」）。另外建议补三项系统层设置：
+
+```ini
+# /etc/systemd/system/pocket-mcp.service.d/limits.conf
+[Service]
+LimitNOFILE=65535
+```
+
+```ini
+# /etc/sysctl.d/99-pocket-mcp.conf
+net.ipv4.tcp_max_tw_buckets = 65536
+net.ipv4.tcp_tw_reuse = 1
+net.core.somaxconn = 4096
+```
+
+再加一个自愈定时器（每 2 分钟探活，连续失败 2 次自动重启）：脚本 `pocket-mcp-healthcheck.sh`、
+单元 `pocket-mcp-health.service`、`pocket-mcp-health.timer`（`OnCalendar=*:0/2`），完整内容见
+`README` 所在仓库的提交说明或服务器上的 `/usr/local/bin/pocket-mcp-healthcheck.sh`。
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now pocket-mcp-health.timer
+```
+
+验证：`ss -lnt 'sport = :9000'` 的 `Send-Q` 应为 **512**；并发压测 100 个连接应全部成功。
+
 ## License
 
 GPL-2.0-or-later，见 [LICENSE](LICENSE)。
