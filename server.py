@@ -1483,14 +1483,30 @@ def ensure_selfsigned_cert(host: str, directory: str) -> Tuple[str, str]:
 
 class MCPHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    # Python 默认 backlog 只有 5：手机唤醒时并发连接一多就被内核丢弃，
+    # 客户端表现为连接失败而服务端没有任何日志（请求没进 handler）。
+    # 内核 somaxconn 通常 4096，这里给 512 足够且安全。
+    request_queue_size = 512
     # On Windows SO_REUSEADDR can hide a real port conflict; disable reuse there.
     allow_reuse_address = os.name != "nt"
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        """连接层错误（accept 失败、TLS 握手失败、超时）默认是静默的，这里记日志。"""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, OSError) and getattr(exc, "errno", None) in (errno.EMFILE, errno.ENFILE):
+            log("资源不足（fd 用尽）：%r，建议提高 LimitNOFILE" % (exc,))
+        elif isinstance(exc, (ssl.SSLError, TimeoutError, ConnectionError)):
+            log("连接异常：%r（来自 %s）" % (exc, client_address))
+        else:
+            log("处理请求出错：%r（来自 %s）" % (exc, client_address))
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = SERVER_NAME + "/" + SERVER_VERSION
     sys_version = ""
+    # 半开连接最多占线程 65 秒，避免慢客户端长期占线程（也配合 45s 客户端超时）。
+    timeout = 65
 
     # BaseHTTPRequestHandler logs through this method; use our own one-line log.
     def log_message(self, fmt: str, *args: Any) -> None:
